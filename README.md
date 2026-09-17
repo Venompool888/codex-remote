@@ -12,6 +12,17 @@ Remote is an Android-native client for Codex running on a Linux or macOS server.
 
 This is an independent community client, not an official OpenAI product. Protocol v2, scoped device credentials, resumable attachments, remote skills/plugins/apps, and reconnect safety are implemented. Internet-facing Hosts require HTTPS/WSS; see the compatibility gates below and the [0.3.1 release notes](docs/releases/0.3.1.md).
 
+## License and commercial use
+
+**Source-available for noncommercial use.** Project-authored code is licensed
+under [PolyForm Noncommercial 1.0.0](LICENSE), not AGPL. Commercial use outside
+that license's permitted purposes—including commercial resale, paid hosting,
+and use in commercial products—requires separate written permission.
+See [LICENSING.md](LICENSING.md) for scope and how to request commercial terms.
+Third-party components retain their own licenses.
+
+Required Notice: Copyright (c) 2026 Codex Remote contributors.
+
 ## What works
 
 - One-time, five-minute device pairing.
