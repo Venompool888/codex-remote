@@ -1,0 +1,15 @@
+server/node_modules/
+server/dist/
+.gradle/
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/app/build/
+*.jks
+*.keystore
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Device-local update identity; never publish personal serial numbers.
+/scripts/android-device-packages.local.json

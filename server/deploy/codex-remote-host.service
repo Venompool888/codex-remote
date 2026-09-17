@@ -1,0 +1,26 @@
+[Unit]
+Description=Codex Remote Host
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex
+WorkingDirectory=/opt/codex-remote/server
+Environment=NODE_ENV=production
+Environment=CODEX_REMOTE_HOST=127.0.0.1
+Environment=CODEX_REMOTE_PORT=8787
+Environment=CODEX_REMOTE_PUBLIC_URL=https://remote.example.com
+Environment=CODEX_REMOTE_DEFAULT_CWD=/srv/projects
+ExecStart=/usr/bin/node /opt/codex-remote/server/dist/index.js
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/codex/.codex /home/codex/.codex-remote /srv/projects
+
+[Install]
+WantedBy=multi-user.target
+

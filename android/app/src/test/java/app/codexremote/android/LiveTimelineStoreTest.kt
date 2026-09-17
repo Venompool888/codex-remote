@@ -1,0 +1,276 @@
+package app.codexremote.android
+
+import org.json.JSONArray
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class LiveTimelineStoreTest {
+    @Test
+    fun canonicalLiveItemsRestoreAlternatingTimelineWhenHistoryOmitsTools() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject()
+            .put("id", TURN_ID)
+            .put("status", "inProgress")
+            .put("items", JSONArray())))
+        assertEquals(TURN_ID, store.activeTurnId(THREAD_ID))
+        recordCompleted(store, user("live-user", "Inspect it"))
+        recordCompleted(store, agent("live-a1", "commentary", "I’ll inspect the configuration."))
+
+        store.record("item/started", params(item = JSONObject()
+            .put("id", "live-command")
+            .put("type", "commandExecution")
+            .put("status", "inProgress")
+            .put("command", "rg timeout config")))
+        store.record("item/commandExecution/outputDelta", params(itemId = "live-command", delta = "timeout=30"))
+        recordCompleted(store, JSONObject()
+            .put("id", "live-command")
+            .put("type", "commandExecution")
+            .put("status", "completed")
+            .put("command", "rg timeout config")
+            .put("aggregatedOutput", "timeout=30"))
+
+        recordCompleted(store, agent("live-a2", "commentary", "The timeout is 30 seconds; I’ll verify its caller."))
+        recordCompleted(store, agent("live-final", "final_answer", "The configuration is valid."))
+        store.record("turn/completed", params(turn = JSONObject()
+            .put("id", TURN_ID)
+            .put("status", "completed")
+            .put("items", JSONArray())))
+        assertEquals(null, store.activeTurnId(THREAD_ID))
+
+        // Mirrors the current legacy app-server replay: messages survive, command items do not.
+        val history = JSONObject().put("turns", JSONArray().put(JSONObject()
+            .put("id", TURN_ID)
+            .put("status", "completed")
+            .put("items", JSONArray()
+                .put(user("snapshot-user", "Inspect it"))
+                .put(agent("snapshot-a1", "commentary", "I’ll inspect the configuration."))
+                .put(agent("snapshot-a2", "commentary", "The timeout is 30 seconds; I’ll verify its caller."))
+                .put(agent("snapshot-final", "final_answer", "The configuration is valid.")))))
+
+        val items = ThreadProjection.timeline(history, store.snapshots(THREAD_ID))
+
+        assertEquals(
+            listOf(
+                TimelineItem.Kind.USER,
+                TimelineItem.Kind.ACTIVITY_GROUP,
+                TimelineItem.Kind.ASSISTANT,
+            ),
+            items.map { it.kind },
+        )
+        val execution = items[1]
+        assertEquals(
+            listOf(TimelineItem.Kind.COMMENTARY, TimelineItem.Kind.COMMAND, TimelineItem.Kind.COMMENTARY),
+            execution.children.map { it.kind },
+        )
+        assertEquals("Ran rg timeout config", execution.children[1].label)
+        assertEquals("timeout=30", execution.children[1].text)
+        assertFalse(items.any { it.active })
+    }
+
+    @Test
+    fun liveWebSearchUsesActiveStateThenShowsResultDomain() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject()
+            .put("id", TURN_ID)
+            .put("status", "inProgress")
+            .put("items", JSONArray())))
+        val started = JSONObject()
+            .put("id", "web-1")
+            .put("type", "webSearch")
+            .put("query", "Codex CLI reference")
+        store.record("item/started", params(item = started))
+
+        val active = store.snapshots(THREAD_ID).getValue(TURN_ID).items.single()
+        assertEquals("Searching the web for Codex CLI reference", active.label)
+        assertTrue(active.active)
+        assertEquals(TimelineItem.ToolStyle.WEB, active.toolStyle)
+
+        val completed = JSONObject(started.toString()).put("results", JSONArray().put(JSONObject()
+            .put("url", "https://developers.openai.com/codex/reference")))
+        store.record("item/completed", params(item = completed))
+
+        val done = store.snapshots(THREAD_ID).getValue(TURN_ID).items.single()
+        assertEquals("Searched the web for Codex CLI reference | developers.openai.com", done.label)
+        assertFalse(done.active)
+    }
+
+    @Test
+    fun dynamicExecToolUsesTerminalPresentation() {
+        val item = ThreadProjection.projectItem(JSONObject()
+            .put("id", "tool-1")
+            .put("type", "dynamicToolCall")
+            .put("tool", "exec_command")
+            .put("status", "completed")
+            .put("arguments", JSONObject().put("cmd", "codex --version")))
+
+        assertEquals(TimelineItem.Kind.COMMAND, item?.kind)
+        assertEquals("Ran codex --version", item?.label)
+        assertEquals("codex --version", item?.rawCommand)
+    }
+
+    @Test
+    fun shellAndWindowsWrappersAreRemovedFromDisplayLabels() {
+        assertEquals("uname -a", ThreadProjection.displayCommand("/bin/bash -lc 'uname -a'"))
+        assertEquals("df -h /", ThreadProjection.displayCommand("/usr/bin/env bash -lc \"df -h /\""))
+        assertEquals("dir C:\\\\", ThreadProjection.displayCommand("cmd.exe /c dir C:\\\\"))
+        assertEquals("Get-ChildItem", ThreadProjection.displayCommand("powershell -Command Get-ChildItem"))
+    }
+
+    @Test
+    fun runningIntegrationUsesItsActionAndQuery() {
+        val item = ThreadProjection.projectItem(JSONObject()
+            .put("id", "mcp-1")
+            .put("type", "mcpToolCall")
+            .put("status", "inProgress")
+            .put("tool", "search_code")
+            .put("arguments", JSONObject().put("query", "ExecCommandBegin"))
+            .put("appContext", JSONObject()
+                .put("appName", "GitHub")
+                .put("actionName", "Search code")))
+
+        assertEquals("Searching code \"ExecCommandBegin\"", item?.label)
+        assertEquals(TimelineItem.ToolStyle.SEARCH, item?.toolStyle)
+    }
+
+    @Test
+    fun completedLiveToolStopsAnimatingBeforeTurnEnds() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject()
+            .put("id", TURN_ID)
+            .put("status", "inProgress")
+            .put("items", JSONArray())))
+        recordCompleted(store, JSONObject()
+            .put("id", "command-1")
+            .put("type", "commandExecution")
+            .put("status", "completed")
+            .put("command", "pwd")
+            .put("aggregatedOutput", "/root"))
+
+        val thread = JSONObject().put("turns", JSONArray().put(JSONObject()
+            .put("id", TURN_ID)
+            .put("status", "inProgress")
+            .put("items", JSONArray())))
+        val execution = ThreadProjection.timeline(thread, store.snapshots(THREAD_ID)).single()
+
+        assertEquals("Working", execution.label)
+        assertEquals("Ran pwd", execution.children.single().label)
+        assertTrue(execution.active)
+        assertFalse(execution.children.single().active)
+    }
+
+    @Test
+    fun requestedCancellationSurvivesServerCompletedStatus() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject()
+            .put("id", TURN_ID)
+            .put("status", "inProgress")
+            .put("items", JSONArray())))
+        store.record("item/started", params(item = JSONObject()
+            .put("id", "sleep-command")
+            .put("type", "commandExecution")
+            .put("status", "inProgress")
+            .put("command", "sleep 60")))
+
+        store.requestCancellation(THREAD_ID, TURN_ID)
+        store.record("turn/completed", params(turn = JSONObject()
+            .put("id", TURN_ID)
+            .put("status", "completed")
+            .put("items", JSONArray())))
+
+        val snapshot = store.snapshots(THREAD_ID).getValue(TURN_ID)
+        assertEquals("cancelled", snapshot.status)
+        val history = JSONObject().put("turns", JSONArray())
+        val activity = ThreadProjection.timeline(history, store.snapshots(THREAD_ID)).single()
+        assertEquals("Cancelled", activity.label)
+        assertEquals("Command cancelled sleep 60", activity.children.single().label)
+    }
+
+    @Test
+    fun connectionLossFailsTheActiveTurnWithDiagnosticDetail() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject()
+            .put("id", TURN_ID)
+            .put("status", "inProgress")
+            .put("items", JSONArray())))
+
+        assertTrue(store.failActiveTurn(THREAD_ID, "socket closed"))
+
+        val snapshot = store.snapshots(THREAD_ID).getValue(TURN_ID)
+        assertEquals("failed", snapshot.status)
+        assertEquals("Connection failed", snapshot.items.single().label)
+        assertEquals("socket closed", snapshot.items.single().text)
+    }
+
+    @Test
+    fun streamedFilePatchStatsSurviveSparseCompletedItem() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject()
+            .put("id", TURN_ID)
+            .put("status", "inProgress")
+            .put("items", JSONArray())))
+        store.record("item/started", params(item = JSONObject()
+            .put("id", "file-1")
+            .put("type", "fileChange")
+            .put("status", "inProgress")
+            .put("changes", JSONArray())))
+        store.record("item/fileChange/patchUpdated", params(itemId = "file-1")
+            .put("changes", JSONArray().put(JSONObject()
+                .put("path", "/root/test.txt")
+                .put("kind", JSONObject().put("type", "update"))
+                .put("diff", "@@\n-old\n+new\n+extra"))))
+        recordCompleted(store, JSONObject()
+            .put("id", "file-1")
+            .put("type", "fileChange")
+            .put("status", "completed")
+            .put("changes", JSONArray().put(JSONObject()
+                .put("path", "/root/test.txt")
+                .put("kind", JSONObject().put("type", "update"))
+                .put("diff", ""))))
+
+        val item = store.snapshots(THREAD_ID).getValue(TURN_ID).items.single()
+        assertEquals(1, item.filesChanged)
+        assertEquals(2, item.additions)
+        assertEquals(1, item.deletions)
+        assertEquals("@@\n-old\n+new\n+extra", item.fileChanges.single().patch)
+        assertFalse(item.active)
+    }
+
+    private fun recordCompleted(store: LiveTimelineStore, item: JSONObject) {
+        store.record("item/started", params(item = JSONObject(item.toString())))
+        store.record("item/completed", params(item = item))
+    }
+
+    private fun params(
+        item: JSONObject? = null,
+        turn: JSONObject? = null,
+        itemId: String? = null,
+        delta: String? = null,
+    ) = JSONObject()
+        .put("threadId", THREAD_ID)
+        .put("turnId", TURN_ID)
+        .apply {
+            item?.let { put("item", it) }
+            turn?.let { put("turn", it) }
+            itemId?.let { put("itemId", it) }
+            delta?.let { put("delta", it) }
+        }
+
+    private fun user(id: String, text: String) = JSONObject()
+        .put("id", id)
+        .put("type", "userMessage")
+        .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", text)))
+
+    private fun agent(id: String, phase: String, text: String) = JSONObject()
+        .put("id", id)
+        .put("type", "agentMessage")
+        .put("phase", phase)
+        .put("text", text)
+
+    private companion object {
+        const val THREAD_ID = "thread-live"
+        const val TURN_ID = "turn-live"
+    }
+}

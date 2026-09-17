@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application
+        tools:replace="android:usesCleartextTraffic"
+        android:usesCleartextTraffic="true">
+        <activity
+            android:name=".DebugAttachmentShowcaseActivity"
+            android:exported="true"
+            android:label="Attachment Compose Showcase"
+            android:theme="@style/AppTheme">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

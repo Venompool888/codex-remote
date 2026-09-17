@@ -1,0 +1,609 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-remote.local/schemas/remote-v2.schema.json",
+  "title": "Codex Remote protocol v2 WebSocket messages",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/serverHello"
+    },
+    {
+      "$ref": "#/$defs/clientHello"
+    },
+    {
+      "$ref": "#/$defs/helloAck"
+    },
+    {
+      "$ref": "#/$defs/rpc"
+    },
+    {
+      "$ref": "#/$defs/rpcResult"
+    },
+    {
+      "$ref": "#/$defs/rpcError"
+    },
+    {
+      "$ref": "#/$defs/codexEvent"
+    },
+    {
+      "$ref": "#/$defs/codexRequest"
+    },
+    {
+      "$ref": "#/$defs/serverResponse"
+    },
+    {
+      "$ref": "#/$defs/protocolError"
+    },
+    {
+      "$ref": "#/$defs/hostError"
+    },
+    {
+      "$ref": "#/$defs/serverResponseAck"
+    }
+  ],
+  "$defs": {
+    "nonEmptyString": {
+      "type": "string",
+      "minLength": 1
+    },
+    "jsonObject": {
+      "type": "object"
+    },
+    "protocolVersions": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "name": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "credentialExpiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "scopes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/nonEmptyString"
+          }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rpcMethods",
+        "attachments",
+        "events",
+        "skills",
+        "plugins",
+        "account",
+        "auth"
+      ],
+      "properties": {
+        "rpcMethods": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/nonEmptyString"
+          }
+        },
+        "attachments": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "imageBase64",
+            "chunkedHttp",
+            "acceptedMimeTypes",
+            "maxFilesPerTurn",
+            "maxBytesPerFile"
+          ],
+          "properties": {
+            "imageBase64": {
+              "type": "boolean"
+            },
+            "chunkedHttp": {
+              "type": "boolean"
+            },
+            "acceptedMimeTypes": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "$ref": "#/$defs/nonEmptyString"
+              }
+            },
+            "maxFilesPerTurn": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maxBytesPerFile": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "events": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sequenced",
+            "replay"
+          ],
+          "properties": {
+            "sequenced": {
+              "type": "boolean"
+            },
+            "replay": {
+              "type": "boolean"
+            }
+          }
+        },
+        "skills": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "list",
+            "changedEvents"
+          ],
+          "properties": {
+            "list": {
+              "type": "boolean"
+            },
+            "changedEvents": {
+              "type": "boolean"
+            }
+          }
+        },
+        "plugins": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "installedApps",
+            "experimentalList"
+          ],
+          "properties": {
+            "installedApps": {
+              "type": "boolean"
+            },
+            "experimentalList": {
+              "type": "boolean"
+            }
+          }
+        },
+        "account": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "remoteLogin"
+          ],
+          "properties": {
+            "status": {
+              "type": "boolean"
+            },
+            "remoteLogin": {
+              "type": "boolean"
+            }
+          }
+        },
+        "auth": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "deviceBearer",
+            "expires",
+            "scoped",
+            "rotation",
+            "selfRevocation",
+            "revocationClosesSockets"
+          ],
+          "properties": {
+            "deviceBearer": {
+              "type": "boolean"
+            },
+            "expires": {
+              "type": "boolean"
+            },
+            "scoped": {
+              "type": "boolean"
+            },
+            "rotation": {
+              "type": "boolean"
+            },
+            "selfRevocation": {
+              "type": "boolean"
+            },
+            "revocationClosesSockets": {
+              "type": "boolean"
+            }
+          }
+        },
+        "interactions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "userInput",
+            "elicitation",
+            "approvals",
+            "replay",
+            "acknowledgement"
+          ],
+          "properties": {
+            "userInput": {
+              "type": "boolean"
+            },
+            "elicitation": {
+              "type": "boolean"
+            },
+            "approvals": {
+              "type": "boolean"
+            },
+            "replay": {
+              "type": "boolean"
+            },
+            "acknowledgement": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "serverHello": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "minProtocolVersion",
+        "maxProtocolVersion",
+        "supportedProtocolVersions",
+        "sessionId",
+        "device",
+        "sequence",
+        "capabilities"
+      ],
+      "properties": {
+        "type": {
+          "const": "server_hello"
+        },
+        "minProtocolVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maxProtocolVersion": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "supportedProtocolVersions": {
+          "$ref": "#/$defs/protocolVersions"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "device": {
+          "$ref": "#/$defs/device"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "capabilities": {
+          "$ref": "#/$defs/capabilities"
+        }
+      }
+    },
+    "clientHello": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "supportedProtocolVersions",
+        "client"
+      ],
+      "properties": {
+        "type": {
+          "const": "client_hello"
+        },
+        "supportedProtocolVersions": {
+          "$ref": "#/$defs/protocolVersions"
+        },
+        "client": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "version"
+          ],
+          "properties": {
+            "name": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "version": {
+              "$ref": "#/$defs/nonEmptyString"
+            },
+            "platform": {
+              "type": "string"
+            }
+          }
+        },
+        "lastSequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lastSessionId": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "helloAck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "protocolVersion",
+        "sessionId",
+        "sequence",
+        "replayAvailable",
+        "resyncRequired",
+        "capabilities"
+      ],
+      "properties": {
+        "type": {
+          "const": "hello_ack"
+        },
+        "protocolVersion": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "sessionId": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "replayAvailable": {
+          "type": "boolean"
+        },
+        "resyncRequired": {
+          "type": "boolean"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/capabilities"
+        }
+      }
+    },
+    "rpc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "method"
+      ],
+      "properties": {
+        "type": {
+          "const": "rpc"
+        },
+        "id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "method": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "params": {
+          "$ref": "#/$defs/jsonObject"
+        },
+        "idempotencyKey": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "rpcResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "result"
+      ],
+      "properties": {
+        "type": {
+          "const": "rpc_result"
+        },
+        "id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "result": true
+      }
+    },
+    "rpcError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "rpc_error"
+        },
+        "id": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "error": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "codexEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "sequence",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "type": {
+          "const": "codex_event"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "method": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "params": {
+          "$ref": "#/$defs/jsonObject"
+        }
+      }
+    },
+    "codexRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "requestId",
+        "method"
+      ],
+      "properties": {
+        "type": {
+          "const": "codex_request"
+        },
+        "requestId": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "method": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "params": true,
+        "expiresAt": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "serverResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "requestId"
+      ],
+      "properties": {
+        "type": {
+          "const": "server_response"
+        },
+        "requestId": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "result": true,
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "code",
+            "message"
+          ],
+          "properties": {
+            "code": {
+              "type": "integer"
+            },
+            "message": {
+              "$ref": "#/$defs/nonEmptyString"
+            }
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "result"
+          ]
+        },
+        {
+          "required": [
+            "error"
+          ]
+        }
+      ]
+    },
+    "protocolError": {
+      "type": "object",
+      "required": [
+        "type",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "protocol_error"
+        },
+        "error": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "hostError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "host_error"
+        },
+        "message": {
+          "$ref": "#/$defs/nonEmptyString"
+        }
+      }
+    },
+    "serverResponseAck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "requestId",
+        "status"
+      ],
+      "properties": {
+        "type": {
+          "const": "server_response_ack"
+        },
+        "requestId": {
+          "$ref": "#/$defs/nonEmptyString"
+        },
+        "status": {
+          "enum": [
+            "answered",
+            "expired",
+            "invalid"
+          ]
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

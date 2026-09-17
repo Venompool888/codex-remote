@@ -1,0 +1,4 @@
+<resources>
+    <!-- Keeps the 48dp hit target while matching the native response-action glyph scale. -->
+    <dimen name="response_action_padding">15.5dp</dimen>
+</resources>

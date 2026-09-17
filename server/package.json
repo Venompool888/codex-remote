@@ -1,0 +1,33 @@
+{
+  "name": "codex-remote-host",
+  "version": "0.3.1",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "codex-remote": "dist/cli.js",
+    "codexremote": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "cli": "tsx src/cli.ts",
+    "test": "tsx --test test/*.test.ts",
+    "smoke:codex": "tsx src/smoke.ts",
+    "smoke:host": "tsx src/smoke-host.ts",
+    "smoke:remote": "tsx src/smoke-remote.ts",
+    "devices": "tsx src/devices.ts",
+    "install:cli": "npm run build && node scripts/install-cli.mjs"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3"
+  }
+}
