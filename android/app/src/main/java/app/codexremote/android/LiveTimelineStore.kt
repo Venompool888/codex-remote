@@ -14,6 +14,7 @@ class LiveTimelineStore {
         var status: String,
         val startedAtEpochMs: Long,
         val items: LinkedHashMap<String, TimelineItem> = linkedMapOf(),
+        val completedItems: MutableSet<String> = mutableSetOf(),
     )
 
     private val threads = object : LinkedHashMap<String, LinkedHashMap<String, TurnBuffer>>(8, 0.75f, true) {
@@ -32,16 +33,22 @@ class LiveTimelineStore {
 
         return when (method) {
             "turn/started" -> {
-                turn(threadId, turnId).status = turnObject?.optString("status").orEmpty().ifBlank { "inProgress" }
-                recordTurnItems(threadId, turnId, turnObject)
+                val buffer = turn(threadId, turnId)
+                // A delayed start must not resurrect a turn already settled by a
+                // completion event or an authoritative thread/read snapshot.
+                if (buffer.status.equals("inProgress", ignoreCase = true)) {
+                    buffer.status = turnObject?.optString("status").orEmpty().ifBlank { "inProgress" }
+                }
+                recordTurnItems(threadId, turnId, turnObject, completed = false)
                 true
             }
             "turn/completed", "turn/failed", "turn/cancelled" -> {
                 val buffer = turn(threadId, turnId)
-                buffer.status = if ((threadId to turnId) in cancellationRequests) {
+                buffer.status = if (cancellationRequests.remove(threadId to turnId)) {
                     "cancelled"
                 } else turnObject?.optString("status").orEmpty().ifBlank { method.substringAfter('/') }
-                recordTurnItems(threadId, turnId, turnObject)
+                recordTurnItems(threadId, turnId, turnObject, completed = true)
+                finishItems(buffer)
                 true
             }
             "item/started", "item/completed" -> recordItem(
@@ -49,6 +56,7 @@ class LiveTimelineStore {
                 turnId = turnId,
                 item = params.optJSONObject("item"),
                 active = method == "item/started",
+                completed = method == "item/completed",
             )
             "item/agentMessage/delta" -> appendText(
                 threadId,
@@ -103,14 +111,59 @@ class LiveTimelineStore {
         ?.lastOrNull { (_, turn) -> turn.status.equals("inProgress", ignoreCase = true) }
         ?.key
 
+    fun isTurnTerminal(threadId: String, turnId: String): Boolean = threads[threadId]?.get(turnId)
+        ?.status?.equals("inProgress", ignoreCase = true) == false
+
+    fun isItemCompleted(threadId: String, turnId: String, itemId: String): Boolean =
+        itemId in threads[threadId]?.get(turnId)?.completedItems.orEmpty()
+
+    /** Merge server lifecycle facts without discarding live items absent from legacy history. */
+    fun reconcileThreadSnapshot(threadId: String, thread: JSONObject, capturedRevision: Long, currentRevision: Long): Boolean {
+        if (capturedRevision != currentRevision) return false
+        val terminal = setOf("completed", "failed", "cancelled", "canceled", "interrupted")
+        val turns = thread.optJSONArray("turns")
+        if (turns != null) for (index in 0 until turns.length()) {
+            val turn = turns.optJSONObject(index) ?: continue
+            val id = turn.optString("id")
+            val status = turn.optString("status")
+            if (id.isNotBlank() && status.lowercase() in terminal) {
+                threads[threadId]?.get(id)?.let { it.status = status; finishItems(it) }
+                cancellationRequests -= threadId to id
+            }
+        }
+        val status = when (val value = thread.opt("status")) {
+            is JSONObject -> value.optString("type")
+            else -> value?.toString().orEmpty()
+        }
+        if (status.lowercase() in setOf("idle", "completed", "failed", "cancelled", "canceled", "interrupted")) {
+            settleActiveTurn(threadId)
+        }
+        return true
+    }
+
+    /** The host confirmed that no turn can be interrupted; the outcome remains unknown until refresh. */
+    fun settleActiveTurn(threadId: String, turnId: String? = null) {
+        val entries = threads[threadId]?.entries?.filter { (id, turn) ->
+            (turnId == null || id == turnId) && (turn.status.equals("inProgress", ignoreCase = true) ||
+                (threadId to id) in cancellationRequests)
+        }.orEmpty()
+        entries.forEach { (id, turn) ->
+            turn.status = "unknown"
+            finishItems(turn)
+            cancellationRequests -= threadId to id
+        }
+    }
+
     fun requestCancellation(threadId: String, turnId: String) {
         cancellationRequests += threadId to turnId
         threads[threadId]?.get(turnId)?.status = "cancelled"
     }
 
-    fun clearCancellationRequest(threadId: String, turnId: String) {
-        cancellationRequests -= threadId to turnId
-        threads[threadId]?.get(turnId)?.status = "inProgress"
+    fun clearCancellationRequest(threadId: String, turnId: String, restoreRunning: Boolean = true) {
+        val pending = cancellationRequests.remove(threadId to turnId)
+        if (pending && restoreRunning && threads[threadId]?.get(turnId)?.status == "cancelled") {
+            threads[threadId]?.get(turnId)?.status = "inProgress"
+        }
     }
 
     fun failActiveTurn(threadId: String, reason: String): Boolean {
@@ -118,6 +171,7 @@ class LiveTimelineStore {
             ?.lastOrNull { (_, turn) -> turn.status.equals("inProgress", ignoreCase = true) }
             ?: return false
         entry.value.status = "failed"
+        finishItems(entry.value)
         entry.value.items["connection-failure-${entry.key}"] = TimelineItem(
             id = "connection-failure-${entry.key}",
             label = "Connection failed",
@@ -129,11 +183,11 @@ class LiveTimelineStore {
         return true
     }
 
-    private fun recordTurnItems(threadId: String, turnId: String, turnObject: JSONObject?): Boolean {
+    private fun recordTurnItems(threadId: String, turnId: String, turnObject: JSONObject?, completed: Boolean): Boolean {
         val items = turnObject?.optJSONArray("items") ?: return false
         var changed = false
         for (index in 0 until items.length()) {
-            changed = recordItem(threadId, turnId, items.optJSONObject(index), active = false) || changed
+            changed = recordItem(threadId, turnId, items.optJSONObject(index), active = false, completed = completed) || changed
         }
         return changed
     }
@@ -143,9 +197,12 @@ class LiveTimelineStore {
         turnId: String,
         item: JSONObject?,
         active: Boolean,
+        completed: Boolean,
     ): Boolean {
         val projected = item?.let(ThreadProjection::projectItem) ?: return false
         val buffer = turn(threadId, turnId)
+        if (active && (projected.id in buffer.completedItems || !buffer.status.equals("inProgress", ignoreCase = true))) return false
+        if (completed) buffer.completedItems += projected.id
         val previous = buffer.items[projected.id]
         val projectedHasDiff = projected.additions > 0 || projected.deletions > 0
         val mergedPaths = previous?.changedFiles.orEmpty() + projected.changedFiles
@@ -177,6 +234,7 @@ class LiveTimelineStore {
     ): Boolean {
         if (itemId.isBlank() || changes == null) return false
         val buffer = turn(threadId, turnId)
+        if (itemId in buffer.completedItems || !buffer.status.equals("inProgress", ignoreCase = true)) return false
         val current = buffer.items[itemId]
         val projected = ThreadProjection.projectItem(JSONObject()
             .put("id", itemId)
@@ -186,7 +244,8 @@ class LiveTimelineStore {
         val mergedPaths = current?.changedFiles.orEmpty() + projected.changedFiles
         buffer.items[itemId] = projected.copy(
             label = current?.label ?: projected.label,
-            active = current?.active ?: true,
+            active = buffer.status.equals("inProgress", ignoreCase = true) && itemId !in buffer.completedItems &&
+                (current?.active ?: true),
             phase = current?.phase ?: projected.phase,
             changedFiles = mergedPaths,
             fileDiffs = mergeFileDiffs(current?.fileDiffs.orEmpty(), projected.fileDiffs),
@@ -209,6 +268,7 @@ class LiveTimelineStore {
         if (delta.isEmpty()) return false
         val id = itemId.ifBlank { "live-${fallbackKind.name.lowercase()}-$turnId" }
         val buffer = turn(threadId, turnId)
+        if (id in buffer.completedItems || !buffer.status.equals("inProgress", ignoreCase = true)) return false
         val current = buffer.items[id] ?: TimelineItem(
             id = id,
             label = fallbackLabel,
@@ -230,6 +290,7 @@ class LiveTimelineStore {
         if (itemId.isBlank()) return false
         val buffer = turn(threadId, turnId)
         val current = buffer.items[itemId] ?: return false
+        if (itemId in buffer.completedItems || !buffer.status.equals("inProgress", ignoreCase = true)) return false
         if (current.text.isBlank() || current.text.endsWith('\n')) return false
         buffer.items[itemId] = current.copy(text = current.text + "\n", active = true)
         return true
@@ -243,7 +304,29 @@ class LiveTimelineStore {
     }
 
     private fun trimItems(buffer: TurnBuffer) {
-        while (buffer.items.size > MAX_ITEMS_PER_TURN) buffer.items.remove(buffer.items.keys.first())
+        while (buffer.items.size > MAX_ITEMS_PER_TURN) {
+            val oldest = buffer.items.keys.first()
+            buffer.items.remove(oldest)
+            buffer.completedItems.remove(oldest)
+        }
+    }
+
+    private fun finishItems(buffer: TurnBuffer) {
+        buffer.items.replaceAll { _, item ->
+            val wasRunning = item.active || item.phase?.lowercase() in
+                setOf("inprogress", "in_progress", "running", "started")
+            item.copy(
+                active = false,
+                phase = if (wasRunning) buffer.status else item.phase,
+                label = if (wasRunning && item.kind == TimelineItem.Kind.COMMAND &&
+                    buffer.status.equals("cancelled", ignoreCase = true))
+                    item.label.replaceFirst(Regex("^Running\\b"), "Command cancelled")
+                else if (wasRunning && item.kind == TimelineItem.Kind.COMMAND &&
+                    buffer.status.equals("failed", ignoreCase = true))
+                    item.label.replaceFirst(Regex("^Running\\b"), "Command failed")
+                else item.label,
+            )
+        }
     }
 
     private fun mergeFileDiffs(

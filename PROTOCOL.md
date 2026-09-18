@@ -175,3 +175,25 @@ Each negotiated opaque connection retains at most1024 projection jobs including 
 ### Attachment size metadata
 
 attachments.maxBytesByKind optionally gives per-kind byte limits; maxBytesPerFile remains the global ceiling. A too_large HTTP response may include numeric maxBytes. Clients must treat it as display metadata only, validate its type/range, and use a generic safe error when absent or malformed. Older clients may ignore these additive fields. Server limits and permission checks remain authoritative.
+
+## Permission menu compatibility
+
+The Remote Host augments `permissionProfile/list` with two optional local entries:
+`local:auto-review` and `local:config`. Clients must check `allowed`; absence means
+that the host does not advertise the feature. Auto-review is capability-probed
+without starting a model turn and maps to `permissions: ":workspace"` with
+`approvalsReviewer: "auto_review"`. Built-in modes explicitly reset the reviewer
+to `user` when selected after Auto-review.
+
+`local:config` is a Remote Host selection marker, never a Codex profile ID. For
+`thread/start`, the host removes permission overrides so Codex loads its effective
+configuration. For `turn/start`, the host resolves the task directory and opens an
+ephemeral thread without starting a turn, copies Codex's effective profile or
+sandbox policy and approval settings, then unsubscribes the probe. This prevents
+an existing task's previous Full access or Auto-review settings from persisting
+when Custom is selected. Raw configuration is not sent to the client. Existing
+named profiles remain available under their original IDs.
+
+New clients keep unsupported entries visible and disabled on older hosts. A
+resumed configuration-based task on an older host sends no synthetic override,
+retaining the task's current host settings.

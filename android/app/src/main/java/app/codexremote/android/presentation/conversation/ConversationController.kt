@@ -14,7 +14,8 @@ class ConversationController(
     private val onShowDiagnostics: () -> Unit = {},
     private val onOpenModel: () -> Unit = {},
     private val onOpenPermissions: () -> Unit = {},
-    private val onRetryLoading: () -> Unit = {}
+    private val onRetryLoading: () -> Unit = {},
+    private val onExportDiagnostics: () -> Unit = {}
 ) {
     private val _uiState = mutableStateOf(ConversationUiState())
     val uiState: State<ConversationUiState> = _uiState
@@ -135,6 +136,7 @@ class ConversationController(
     fun openConnections() = onOpenConnections()
     fun enableNotifications() = onEnableNotifications()
     fun showDiagnostics() = onShowDiagnostics()
+    fun exportDiagnostics() = onExportDiagnostics()
     fun openModel() = onOpenModel()
     fun openPermissions() = onOpenPermissions()
     fun copyText(text: String, label: String) = onCopyText(text, label)

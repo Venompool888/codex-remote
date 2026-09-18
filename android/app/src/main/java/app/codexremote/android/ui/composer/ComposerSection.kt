@@ -51,6 +51,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -69,6 +71,7 @@ fun ComposerSection(
 ) {
     val state = controller.uiState.value
     var isFocused by remember { mutableStateOf(false) }
+    var permissionAnchorTop by remember { mutableStateOf(0f) }
 
     val isExpanded = state.isExpanded || isFocused || state.text.isNotEmpty() ||
         state.attachments.isNotEmpty() || state.isTurnRunning
@@ -83,97 +86,109 @@ fun ComposerSection(
             .imePadding()
             .padding(horizontal = 12.dp, vertical = 6.dp)
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(shape)
-                .background(AppColors.composer, shape)
-                .border(BorderStroke(1.dp, AppColors.outlineVariant), shape)
-        ) {
-            // 1. Attachment Strip
-            if (state.attachments.isNotEmpty()) {
-                ComposerAttachmentStrip(
-                    items = state.attachments,
-                    onCardClick = { controller.clickAttachment(it) },
-                    onRemoveClick = { controller.removeAttachment(it) }
+        // Keep the popup anchor inside the inset padding, so the IME moves both surfaces.
+        Box(Modifier.onGloballyPositioned { permissionAnchorTop = it.positionInWindow().y }) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(shape)
+                    .background(AppColors.composer, shape)
+                    .border(BorderStroke(1.dp, AppColors.outlineVariant), shape)
+            ) {
+                // 1. Attachment Strip
+                if (state.attachments.isNotEmpty()) {
+                    ComposerAttachmentStrip(
+                        items = state.attachments,
+                        onCardClick = { controller.clickAttachment(it) },
+                        onRemoveClick = { controller.removeAttachment(it) }
+                    )
+                }
+
+                // 2. Main composer core layout (Editor + Action Bar)
+                ComposerCoreLayout(
+                    isExpanded = isExpanded,
+                    editor = {
+                        val inputTextStyle = TextStyle(
+                            fontSize = 15.sp,
+                            lineHeight = 22.sp,
+                            color = AppColors.onSurface
+                        )
+
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(
+                                    start = if (isExpanded) 16.dp else 4.dp,
+                                    end = if (isExpanded) 16.dp else 4.dp,
+                                    top = if (isExpanded) 14.dp else 0.dp,
+                                    bottom = if (isExpanded) 8.dp else 0.dp
+                                ),
+                            contentAlignment = if (isExpanded) Alignment.TopStart else Alignment.CenterStart
+                        ) {
+                            if (state.text.isEmpty()) {
+                                val placeholder = state.hint?.takeIf { it.isNotBlank() }
+                                    ?: stringResource(R.string.composer_generic_hint)
+                                Text(
+                                    text = placeholder,
+                                    style = inputTextStyle.copy(color = AppColors.onSurfaceMuted),
+                                    maxLines = if (isExpanded) Int.MAX_VALUE else 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+
+                            val selectionColors = TextSelectionColors(
+                                handleColor = AppColors.primary,
+                                backgroundColor = AppColors.primaryContainer
+                            )
+
+                            CompositionLocalProvider(LocalTextSelectionColors provides selectionColors) {
+                                BasicTextField(
+                                    value = state.textFieldValue,
+                                    onValueChange = { controller.updateTextFieldValue(it) },
+                                    textStyle = inputTextStyle,
+                                    cursorBrush = SolidColor(AppColors.primary),
+                                    maxLines = if (isExpanded) Int.MAX_VALUE else 1,
+                                    singleLine = !isExpanded,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .then(
+                                            if (isExpanded) {
+                                                Modifier.heightIn(min = 24.dp, max = 160.dp)
+                                            } else {
+                                                Modifier.heightIn(min = 22.dp)
+                                            }
+                                        )
+                                        .onFocusChanged {
+                                            isFocused = it.isFocused
+                                            if (it.isFocused) {
+                                                controller.setExpanded(true)
+                                            } else if (state.text.isEmpty() && state.attachments.isEmpty() && !state.isTurnRunning) {
+                                                controller.setExpanded(false)
+                                            }
+                                        }
+                                )
+                            }
+                        }
+                    },
+                    actionBar = {
+                        ComposerActionBar(
+                            state = state.actionBarState.copy(isExpanded = isExpanded),
+                            onPlusClick = { controller.toggleAddMenu(true) },
+                            onModelClick = { controller.toggleModelMenu(true) },
+                            onSendClick = { controller.sendOrStop() },
+                            onPermissionClick = { controller.togglePermissionMenu(true) }
+                        )
+                    }
                 )
             }
 
-            // 2. Main composer core layout (Editor + Action Bar)
-            ComposerCoreLayout(
-                isExpanded = isExpanded,
-                editor = {
-                    val inputTextStyle = TextStyle(
-                        fontSize = 15.sp,
-                        lineHeight = 22.sp,
-                        color = AppColors.onSurface
-                    )
-
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(
-                                start = if (isExpanded) 16.dp else 4.dp,
-                                end = if (isExpanded) 16.dp else 4.dp,
-                                top = if (isExpanded) 14.dp else 0.dp,
-                                bottom = if (isExpanded) 8.dp else 0.dp
-                            ),
-                        contentAlignment = if (isExpanded) Alignment.TopStart else Alignment.CenterStart
-                    ) {
-                        if (state.text.isEmpty()) {
-                            val placeholder = state.hint?.takeIf { it.isNotBlank() }
-                                ?: stringResource(R.string.composer_generic_hint)
-                            Text(
-                                text = placeholder,
-                                style = inputTextStyle.copy(color = AppColors.onSurfaceMuted),
-                                maxLines = if (isExpanded) Int.MAX_VALUE else 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-
-                        val selectionColors = TextSelectionColors(
-                            handleColor = AppColors.primary,
-                            backgroundColor = AppColors.primaryContainer
-                        )
-
-                        CompositionLocalProvider(LocalTextSelectionColors provides selectionColors) {
-                            BasicTextField(
-                                value = state.textFieldValue,
-                                onValueChange = { controller.updateTextFieldValue(it) },
-                                textStyle = inputTextStyle,
-                                cursorBrush = SolidColor(AppColors.primary),
-                                maxLines = if (isExpanded) Int.MAX_VALUE else 1,
-                                singleLine = !isExpanded,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .then(
-                                        if (isExpanded) {
-                                            Modifier.heightIn(min = 24.dp, max = 160.dp)
-                                        } else {
-                                            Modifier.heightIn(min = 22.dp)
-                                        }
-                                    )
-                                    .onFocusChanged {
-                                        isFocused = it.isFocused
-                                        if (it.isFocused) {
-                                            controller.setExpanded(true)
-                                        } else if (state.text.isEmpty() && state.attachments.isEmpty() && !state.isTurnRunning) {
-                                            controller.setExpanded(false)
-                                        }
-                                    }
-                            )
-                        }
-                    }
-                },
-                actionBar = {
-                    ComposerActionBar(
-                        state = state.actionBarState.copy(isExpanded = isExpanded),
-                        onPlusClick = { controller.toggleAddMenu(true) },
-                        onModelClick = { controller.toggleModelMenu(true) },
-                        onSendClick = { controller.sendOrStop() },
-                        onPermissionClick = { controller.togglePermissionMenu(true) }
-                    )
-                }
+            PermissionMenu(
+                expanded = state.showPermissionMenu,
+                anchorTopPx = permissionAnchorTop,
+                options = state.permissionOptions,
+                selectedId = state.selectedPermissionId,
+                onDismiss = { controller.togglePermissionMenu(false) },
+                onSelect = controller::selectPermission
             )
         }
 
@@ -372,62 +387,6 @@ fun ComposerSection(
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(24.dp))
-                }
-            }
-        }
-
-        // Permission Menu Bottom Sheet
-        if (state.showPermissionMenu) {
-            ModalBottomSheet(
-                onDismissRequest = { controller.togglePermissionMenu(false) },
-                sheetState = rememberModalBottomSheetState(),
-                containerColor = AppColors.surfaceContainerHigh
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 20.dp, vertical = 12.dp)
-                ) {
-                    Text(
-                        text = "Permissions",
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = AppColors.onSurface
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    state.permissionOptions.forEach { option ->
-                        val isSelected = option.id == state.selectedPermissionId
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(if (isSelected) AppColors.surfaceContainerHighest else AppColors.surfaceContainerHigh)
-                                .clickable(enabled = option.enabled) { controller.selectPermission(option.id) }
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = option.label,
-                                    fontSize = 14.sp,
-                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                    color = if (option.enabled) AppColors.onSurface else AppColors.onSurfaceMuted
-                                )
-                                if (option.description.isNotBlank()) {
-                                    Text(
-                                        text = option.description,
-                                        fontSize = 12.sp,
-                                        color = AppColors.onSurfaceVariant
-                                    )
-                                }
-                            }
-                            if (isSelected) {
-                                Icon(painter = painterResource(R.drawable.ic_check), contentDescription = null, tint = AppColors.primary, modifier = Modifier.size(16.dp))
-                            }
-                        }
-                    }
                     Spacer(modifier = Modifier.height(24.dp))
                 }
             }

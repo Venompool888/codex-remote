@@ -16,12 +16,12 @@ data class ComposerOption(
 )
 
 fun resolvePermissionIcon(id: String?): Int = when {
-    id == null -> R.drawable.ic_warning_amber
+    id == null -> R.drawable.ic_codex_permission_hand
     id.contains("full", ignoreCase = true) -> R.drawable.ic_warning_amber
-    id.contains("workspace", ignoreCase = true) -> R.drawable.ic_warning_amber
-    id.contains("guardian", ignoreCase = true) -> R.drawable.ic_codex_permission_guardian
-    id.contains("read", ignoreCase = true) -> R.drawable.ic_codex_permission_profile
-    else -> R.drawable.ic_warning_amber
+    id.contains("guardian", ignoreCase = true) || id.contains("auto-review", ignoreCase = true) -> R.drawable.ic_permission_auto_review
+    id.contains("workspace", ignoreCase = true) -> R.drawable.ic_codex_permission_hand
+    id.contains("read", ignoreCase = true) -> R.drawable.ic_permission_read_only
+    else -> R.drawable.ic_codex_permission_custom
 }
 
 data class ComposerUiState(

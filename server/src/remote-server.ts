@@ -32,6 +32,7 @@ import { ArtifactStore } from "./artifact-store.js";
 import { CapabilityCatalog } from "./capability-catalog.js";
 import { AttachmentStore, AttachmentSizeError } from "./attachment-store.js";
 import { OrderedDelivery } from './ordered-delivery.js';
+import { CUSTOM_CONFIG_PERMISSION, resolvePermissionSelection } from './permission-selection.js';
 
 interface RemoteHostOptions {
   host: string;
@@ -91,6 +92,7 @@ export class RemoteHost {
   private authRecheckTimer: NodeJS.Timeout | null = null;
   private pairingTicket: PairingTicket | null = null;
   private installedAppsAvailable = false;
+  private autoReviewAvailable: boolean | null = null;
   private installedAppsSnapshot: Record<string, unknown> = { apps: [] };
   private readonly eventJournal: Array<Record<string, unknown> & { sequence: number }> = [];
   private readonly idempotency = new Map<string, IdempotencyEntry>();
@@ -676,6 +678,9 @@ export class RemoteHost {
     }
     const execute = async (): Promise<RpcOutcome> => {
       try {
+        if (message.method === "thread/start" || message.method === "turn/start") {
+          params = await resolvePermissionSelection(message.method, params, this.options.codex);
+        }
         if ((message.method === "turn/start" || message.method === "turn/steer") && state.protocolVersion >= 2) {
           if (Array.isArray(params.input) && params.input.some((item: any) => ["remoteCapability", "skill", "mention"].includes(item?.type))) {
             const thread = await this.options.codex.call("thread/read", { threadId: params.threadId, includeTurns: false });
@@ -693,6 +698,23 @@ export class RemoteHost {
           if (message.method !== "turn/start" || !messageOf(error).startsWith("thread not found:")) throw error;
           await this.options.codex.call("thread/resume", { threadId: params.threadId });
           result = await this.options.codex.call(message.method, params, 60_000);
+        }
+        if (message.method === "permissionProfile/list" && isObject(result) && Array.isArray(result.data)) {
+          const data = [...result.data];
+          if (this.autoReviewAvailable === null) {
+            try {
+              const probe = await this.options.codex.call("thread/start", {
+                cwd: this.options.defaultCwd || process.cwd(), ephemeral: true,
+                permissions: ":workspace", approvalsReviewer: "auto_review",
+              }) as any;
+              this.autoReviewAvailable = probe?.approvalsReviewer === "auto_review";
+              const probeId = probe?.thread?.id;
+              if (typeof probeId === "string") await this.options.codex.call("thread/unsubscribe", { threadId: probeId }).catch(() => undefined);
+            } catch { this.autoReviewAvailable = false; }
+          }
+          data.push({ id: "local:auto-review", description: "Reviews elevated requests automatically", allowed: this.autoReviewAvailable });
+          data.push({ id: CUSTOM_CONFIG_PERMISSION, description: "Codex uses the permission defined in config.toml", allowed: true });
+          result = { ...result, data };
         }
         if (message.method === "thread/read") result = await hydrateThreadHistory(result);
         return { ok: true, result: this.sanitizePayload(result) };

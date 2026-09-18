@@ -9,6 +9,7 @@ import java.util.concurrent.TimeUnit
 /** One ordered, bounded worker per process; diagnostics must never break app operations. */
 class DiagnosticLogs private constructor(context: Context) {
     private val store = DiagnosticLogStore(File(context.filesDir, "diagnostics"))
+    private val recentThreads = DiagnosticRecentThreads(File(context.filesDir, "diagnostics/recent-threads.json"))
     private val exports = File(context.cacheDir, "diagnostic-exports")
     private val header = "Codex Remote ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})\n" +
         "Android ${android.os.Build.VERSION.RELEASE} / API ${android.os.Build.VERSION.SDK_INT}\n" +
@@ -35,6 +36,7 @@ class DiagnosticLogs private constructor(context: Context) {
         if (!submit {
             val ok = runCatching {
                 store.clear()
+                recentThreads.clear()
                 exports.listFiles()?.forEach { check(it.delete()) }
             }.isSuccess
             storageFailure = !ok
@@ -42,14 +44,36 @@ class DiagnosticLogs private constructor(context: Context) {
         }) done(false)
     }
 
-    fun export(done: (File?) -> Unit) {
+    fun recordThreadState(state: org.json.JSONObject) {
+        val snapshot = org.json.JSONObject(state.toString())
+        submit { runCatching {
+            if (recentThreads.record(snapshot)) {
+                storageFailure = true
+                store.append(DiagnosticRedaction.record("diagnostics.recent_state_recovered",
+                    detail = "Unreadable recent task metadata was reset; earlier task snapshots are unavailable."))
+            }
+        }.onFailure { storageFailure = true } }
+    }
+
+    fun exportBundle(context: org.json.JSONObject, done: (File?) -> Unit) {
+        val snapshot = org.json.JSONObject(context.toString())
         if (!submit {
             done(runCatching {
                 exports.mkdirs()
-                // One fixed, bounded snapshot; repeated sharing cannot fill the cache.
-                File(exports, "codex-remote-diagnostics.txt").apply {
-                    writeText(header + (if (storageFailure) "Some diagnostic entries could not be saved.\n\n" else "") + store.read())
-                }
+                val file = File(exports, "codex-remote-diagnostics-${java.util.UUID.randomUUID()}.zip")
+                try {
+                    val recent = runCatching { recentThreads.read() }.getOrElse {
+                        storageFailure = true
+                        org.json.JSONArray()
+                    }
+                    DiagnosticBundle.write(file,
+                        header + (if (storageFailure) "Some diagnostic entries could not be saved.\n\n" else "") + store.read(),
+                        snapshot, recent)
+                    // Keep a small number of immutable snapshots for outstanding share grants.
+                    exports.listFiles()?.filter { it.extension == "zip" && it != file }
+                        ?.sortedByDescending { it.lastModified() }?.drop(3)?.forEach { it.delete() }
+                    file
+                } catch (error: Exception) { file.delete(); throw error }
             }.getOrNull())
         }) done(null)
     }

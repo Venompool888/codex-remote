@@ -98,6 +98,22 @@ class MainActivity : AppCompatActivity() {
     private val rpcDiagnostics by lazy { RpcDiagnostics(diagnosticLogs::record) }
     private var diagnosticReport by mutableStateOf<String?>(null)
     private var diagnosticReadGeneration = 0L
+    private var diagnosticExportBusy = false
+    private var lastDiagnosticThreadState: String? = null
+    private var pendingDiagnosticSave: File? = null
+    private val saveDiagnosticBundle = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        val file = pendingDiagnosticSave
+        pendingDiagnosticSave = null
+        if (uri != null && file != null) {
+            Thread {
+                val ok = runCatching {
+                    contentResolver.openOutputStream(uri, "wt")?.use { output -> file.inputStream().use { it.copyTo(output) } }
+                        ?: error("Could not open destination")
+                }.isSuccess
+                runOnUiThread { if (!isDestroyed && !isFinishing) toast(if (ok) "Diagnostic bundle saved" else "Could not save diagnostic bundle") }
+            }.start()
+        }
+    }
     private val callbackErrors = mutableMapOf<String, (String) -> Unit>()
     private val imageCache = object : LruCache<String, Bitmap>(24 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap) = value.byteCount
@@ -167,7 +183,7 @@ class MainActivity : AppCompatActivity() {
     private val remoteAppsCache = mutableMapOf<String, List<RemoteInstalledApp>>()
     private var turnRunning = false
     private var models: List<ModelOption> = emptyList()
-    private var permissionProfiles: List<PermissionOption> = emptyList()
+    private var permissionProfiles: List<PermissionProfile> = emptyList()
     private var selectedModel: String? = null
     private var selectedModelDisplay: String? = null
     private var selectedEffort: String? = null
@@ -179,6 +195,7 @@ class MainActivity : AppCompatActivity() {
     private var selectedPermissionId: String? = null
     private val usageByThread = mutableMapOf<String, UsageSnapshot>()
     private val liveTimelineStore = LiveTimelineStore()
+    private var turnLifecycleRevision = 0L
     private var liveAssistantText = ""
     private var followTimelineLatest = true
     private var liveTimelineRenderScheduled = false
@@ -220,6 +237,9 @@ class MainActivity : AppCompatActivity() {
         delegate.localNightMode = AppCompatDelegate.MODE_NIGHT_FOLLOW_SYSTEM
         super.onCreate(savedInstanceState)
         diagnosticLogs.record("app.started")
+        savedInstanceState?.getString("diagnosticSaveFile")?.takeIf {
+            it.matches(Regex("codex-remote-diagnostics-[a-f0-9-]+\\.zip"))
+        }?.let { name -> pendingDiagnosticSave = File(cacheDir, "diagnostic-exports/$name").takeIf { it.isFile } }
         pendingSidebarState = savedInstanceState?.getBundle("remoteSidebar")
         pendingInteractionDrafts = runCatching { JSONObject(savedInstanceState?.getString("interactionDrafts") ?: "{}") }.getOrDefault(JSONObject())
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -831,6 +851,7 @@ class MainActivity : AppCompatActivity() {
                 conversationController.failThreadLoad(threadLoadError!!)
             }
         }, 30_000L)
+        val lifecycleRevision = turnLifecycleRevision
         rpc("thread/resume", JSONObject().put("threadId", threadId), { error ->
             if (navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId)) {
                 threadLoadError = if (error.contains("no rollout found", ignoreCase = true))
@@ -845,12 +866,31 @@ class MainActivity : AppCompatActivity() {
                 conversationController.failThreadLoad("Couldn't load this conversation. Please try again.")
                 return@rpc
             }
-            currentThread = thread
             selectedModel = result.optString("model").ifBlank { null }
             selectedEffort = result.optString("reasoningEffort").ifBlank { null }
             selectedServiceTier = result.optString("serviceTier").ifBlank { null }
-            selectedPermissionId = result.optJSONObject("activePermissionProfile")?.optString("id")?.ifBlank { null }
-            showConversation(thread)
+            val activePermissionId = result.optJSONObject("activePermissionProfile")?.optString("id")?.ifBlank { null }
+            selectedPermissionId = when {
+                activePermissionId == PermissionProfiles.WORKSPACE && result.optString("approvalsReviewer") == "auto_review" -> PermissionProfiles.AUTO_REVIEW
+                activePermissionId == null -> PermissionProfiles.CUSTOM_CONFIG
+                else -> activePermissionId
+            }
+            if (lifecycleRevision == turnLifecycleRevision) {
+                liveTimelineStore.reconcileThreadSnapshot(threadId, thread, lifecycleRevision, turnLifecycleRevision)
+                currentThread = thread
+                showConversation(thread)
+            } else {
+                // Keep navigation/composer setup from the resume result, but
+                // omit lifecycle fields that predate a newer event.
+                val latestRunning = turnRunning
+                val shell = JSONObject(thread.toString()).put("turns", JSONArray())
+                shell.remove("status")
+                currentThread = shell
+                showConversation(shell)
+                turnRunning = latestRunning
+                renderCurrentTimelineFromEvents(shell)
+                updateComposerPrimaryButton()
+            }
             loadComposerCapabilities(thread.optString("cwd"))
             // thread/resume can omit persisted custom tool calls. Always follow
             // it with the enriched includeTurns read so a cold-open timeline is
@@ -867,6 +907,7 @@ class MainActivity : AppCompatActivity() {
         }
         refreshInFlight = true
         val ticket = navigationRequests.capture(connectedServerUrl, threadId)
+        val lifecycleRevision = turnLifecycleRevision
         val clearLive = clearLiveOnNextRefresh
         clearLiveOnNextRefresh = false
         rpc("thread/read", JSONObject().put("threadId", threadId).put("includeTurns", true), { error ->
@@ -881,8 +922,14 @@ class MainActivity : AppCompatActivity() {
             refreshInFlight = false
             val thread = result.optJSONObject("thread")
             if (thread != null && thread.optString("id") == threadId) {
-                if (conversationController.isThreadLoadPending) conversationController.finishThreadLoad()
-                applyThreadSnapshot(thread, clearLive)
+                if (lifecycleRevision == turnLifecycleRevision) {
+                    if (conversationController.isThreadLoadPending) conversationController.finishThreadLoad()
+                    applyThreadSnapshot(thread, clearLive, lifecycleRevision)
+                } else {
+                    // The response was taken before a newer lifecycle event. Its
+                    // thread status and turns must not replace the current view.
+                    scheduleRefresh(clearLive = clearLive)
+                }
             } else if (conversationController.isThreadLoadPending) {
                 conversationController.failThreadLoad("Couldn't load the conversation history. Please try again.")
             }
@@ -910,7 +957,7 @@ class MainActivity : AppCompatActivity() {
         submission.model?.let { params.put("model", it) }
         submission.effort?.let { params.put("effort", it) }
         submission.tier?.let { params.put("serviceTier", it) }
-        submission.permission?.let { params.put("permissions", it).put("approvalPolicy", if (isFullAccess(it)) "never" else "on-request") }
+        PermissionProfiles.applySelection(params, submission.permission)
         TurnCollaborationMode.apply(params, submission.plan, submission.model, submission.effort)
         params.put("_remoteWriteKey", durableWriteKey(submittedScope, "turn", params.toString()))
         fun acceptSubmission(result: JSONObject) {
@@ -1091,8 +1138,32 @@ class MainActivity : AppCompatActivity() {
             is JSONObject -> value.optString("type")
             else -> value?.toString().orEmpty()
         }
-        return status.lowercase(Locale.ROOT) in setOf("active", "running", "inprogress", "in_progress")
+        val runningStatuses = setOf("active", "running", "inprogress", "in_progress", "started", "pending")
+        if (status.isNotBlank()) return status.lowercase(Locale.ROOT) in runningStatuses
+        val turns = thread.optJSONArray("turns")
+        if (turns != null) for (index in turns.length() - 1 downTo 0) {
+            val turnStatus = turns.optJSONObject(index)?.optString("status").orEmpty()
+            if (turnStatus.isNotBlank()) return turnStatus.lowercase(Locale.ROOT) in runningStatuses
+        }
+        return false
     }
+
+    private fun snapshotRunningTurnId(threadId: String): String? = currentThread
+        ?.takeIf { it.optString("id") == threadId }
+        ?.takeUnless { thread ->
+            val status = when (val value = thread.opt("status")) {
+                is JSONObject -> value.optString("type")
+                else -> value?.toString().orEmpty()
+            }
+            status.lowercase(Locale.ROOT) in setOf("idle", "completed", "failed", "cancelled", "canceled", "interrupted")
+        }
+        ?.optJSONArray("turns")
+        ?.let { turns -> (turns.length() - 1 downTo 0).firstNotNullOfOrNull { index ->
+            turns.optJSONObject(index)?.takeIf { it.optString("status").lowercase(Locale.ROOT) in
+                setOf("active", "running", "inprogress", "in_progress", "started", "pending") }
+                ?.optString("id")?.ifBlank { null }
+                ?.takeUnless { liveTimelineStore.isTurnTerminal(threadId, it) }
+        } }
 
 
     private fun performComposerSend(thread: JSONObject) {
@@ -1138,7 +1209,7 @@ class MainActivity : AppCompatActivity() {
         // asynchronous thread events that can refresh composer state before
         // turn/start is sent; reading the mutable field later could silently
         // downgrade a confirmed Full Access turn back to workspace access.
-        val submittedPermissionId = selectedPermissionId
+        val submittedPermissionId = PermissionProfiles.submissionId(selectedPermissionId, permissionProfiles)
         val submission = ComposerSubmission(sourceServer, sourceScope, selectedModel, selectedEffort, selectedServiceTier, submittedPermissionId, planMode,
             messageId = "outgoing-${UUID.randomUUID()}", draft = JSONObject(draftStore.read(sourceScope).toString()))
         if (currentThreadId == null && (draftWorkspace ?: thread.optString("cwd")).isBlank()) {
@@ -1173,7 +1244,7 @@ class MainActivity : AppCompatActivity() {
                 return toast("Choose an available working directory first")
             }
             val threadParams = JSONObject().put("cwd", cwd).apply {
-                submittedPermissionId?.let { put("permissions", it); put("approvalPolicy", if (isFullAccess(it)) "never" else "on-request") }
+                PermissionProfiles.applySelection(this, submittedPermissionId)
             }
             threadParams.put("_remoteWriteKey", durableWriteKey(sourceScope, "thread", threadParams.toString()))
             rpcOn(sourceServer, "thread/start", threadParams, { error ->
@@ -1225,22 +1296,43 @@ class MainActivity : AppCompatActivity() {
 
     private fun interruptActiveTurn() {
         val threadId = currentThreadId ?: return
-        val turnId = liveTimelineStore.activeTurnId(threadId)
+        val server = connectedServerUrl ?: return
+        val device = tokenStore.loadCredential(server)?.deviceId
+        val ticket = navigationRequests.capture(server, threadId)
+        val turnId = liveTimelineStore.activeTurnId(threadId) ?: snapshotRunningTurnId(threadId)
         if (turnId == null) {
-            toast("The active turn is not ready to stop yet")
+            // The button can be based on a stale thread status, or turn/start
+            // may not have supplied an id yet. Read the server before retrying.
+            refreshCurrentThread()
+            toast("Checking the task state")
             return
         }
+        val lifecycleRevision = turnLifecycleRevision
         liveTimelineStore.requestCancellation(threadId, turnId)
         renderCurrentTimelineFromEvents()
         rpc(
             "turn/interrupt",
             JSONObject().put("threadId", threadId).put("turnId", turnId),
             { error ->
-                liveTimelineStore.clearCancellationRequest(threadId, turnId)
+                if (!navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId) ||
+                    tokenStore.loadCredential(server)?.deviceId != device) return@rpc
+                if (error.contains("no active turn to interrupt", ignoreCase = true)) {
+                    liveTimelineStore.settleActiveTurn(threadId, turnId)
+                    if (currentThreadId == threadId && lifecycleRevision == turnLifecycleRevision) {
+                        turnRunning = false
+                        liveAssistantText = ""
+                    }
+                    scheduleRefresh(clearLive = true)
+                } else liveTimelineStore.clearCancellationRequest(threadId, turnId,
+                    restoreRunning = liveTimelineStore.activeTurnId(threadId) == null)
                 renderCurrentTimelineFromEvents()
-                toast(error)
+                updateComposerPrimaryButton()
+                if (!error.contains("no active turn to interrupt", ignoreCase = true)) toast(error)
             },
-        ) { scheduleRefresh() }
+        ) {
+            if (navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId) &&
+                tokenStore.loadCredential(server)?.deviceId == device) scheduleRefresh()
+        }
     }
 
 
@@ -1321,6 +1413,16 @@ class MainActivity : AppCompatActivity() {
         val eventThreadId = params.optString("threadId")
         if (eventThreadId.isNotBlank() && eventThreadId != currentThreadId) return
         val method = message.optString("method")
+        val eventTurnId = params.optString("turnId").ifBlank { params.optJSONObject("turn")?.optString("id").orEmpty() }
+        val terminalInSnapshot = if (method == "turn/started" || method == "item/agentMessage/delta")
+            currentThread?.optJSONArray("turns")?.let { turns ->
+                (0 until turns.length()).any { index -> turns.optJSONObject(index)?.let { turn ->
+                    turn.optString("id") == eventTurnId && turn.optString("status").lowercase(Locale.ROOT) in
+                        setOf("completed", "failed", "cancelled", "canceled", "interrupted")
+                } == true }
+            } == true else false
+        if (eventTurnId.isNotBlank() && terminalInSnapshot) return
+        if (method == "thread/status/changed" || method == "turn/started" || method in TURN_FINISHED_EVENTS) turnLifecycleRevision++
         val liveTimelineChanged = liveTimelineStore.record(method, params)
         if (method == "thread/tokenUsage/updated") {
             val usage = params.optJSONObject("tokenUsage")
@@ -1331,6 +1433,9 @@ class MainActivity : AppCompatActivity() {
                 updateUsageButton()
             }
         } else if (method == "item/agentMessage/delta") {
+            if (eventTurnId.isNotBlank() &&
+                (liveTimelineStore.isTurnTerminal(eventThreadId, eventTurnId) ||
+                    liveTimelineStore.isItemCompleted(eventThreadId, eventTurnId, params.optString("itemId")))) return
             turnRunning = true
             updateComposerPrimaryButton()
             if (liveTimelineChanged) {
@@ -1341,6 +1446,7 @@ class MainActivity : AppCompatActivity() {
             }
         } else if (method == "thread/status/changed") {
             turnRunning = params.optJSONObject("status")?.optString("type") == "active"
+            if (!turnRunning && eventThreadId.isNotBlank()) liveTimelineStore.settleActiveTurn(eventThreadId)
             updateComposerPrimaryButton()
             requestThreads()
             if (!turnRunning) scheduleRefresh(clearLive = true)
@@ -1348,12 +1454,17 @@ class MainActivity : AppCompatActivity() {
             val itemType = params.optJSONObject("item")?.optString("type")
             val completesAssistant = method == "item/completed" && itemType == "agentMessage"
             if (method == "turn/started") {
-                turnRunning = true
-                updateComposerPrimaryButton()
+                val startedTurn = params.optString("turnId").ifBlank { params.optJSONObject("turn")?.optString("id").orEmpty() }
+                if (!liveTimelineStore.isTurnTerminal(eventThreadId, startedTurn)) {
+                    turnRunning = true
+                    updateComposerPrimaryButton()
+                }
             }
             if (method in TURN_FINISHED_EVENTS) {
-                turnRunning = false
                 val finishedTurn = params.optString("turnId").ifBlank { params.optJSONObject("turn")?.optString("id").orEmpty() }
+                turnRunning = currentThreadId?.let(liveTimelineStore::activeTurnId) != null ||
+                    currentThreadId?.let(::snapshotRunningTurnId)?.let { it != finishedTurn } == true ||
+                    composerScope in submittingScopes
                 composerScope?.let { outgoingMessages.finish(it, finishedTurn) }
                 renderCurrentTimelineFromEvents()
                 updateComposerPrimaryButton()
@@ -1480,12 +1591,10 @@ class MainActivity : AppCompatActivity() {
             if (!navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId)) return@rpc
             permissionProfiles = jsonObjects(result.optJSONArray("data")).mapNotNull { value ->
                 val id = value.optString("id")
-                if (id.isBlank()) null else PermissionOption(id, jsonText(value, "description"), value.optBoolean("allowed"))
+                if (id.isBlank()) null else PermissionProfile(id, jsonText(value, "description"), value.optBoolean("allowed"))
             }
-            if (selectedPermissionId == null) {
-                selectedPermissionId = permissionProfiles.firstOrNull { it.id.contains("workspace", true) }?.id
-                    ?: permissionProfiles.firstOrNull()?.id
-            }
+            if (selectedPermissionId == null)
+                selectedPermissionId = PermissionProfiles.menu(permissionProfiles).firstOrNull { it.enabled }?.id
             updateComposerLabels()
         }
         if (cwd.isBlank()) return
@@ -1518,23 +1627,9 @@ class MainActivity : AppCompatActivity() {
             ?: value?.split('-', '_')?.joinToString(" ") { it.replaceFirstChar(Char::uppercase) }
             ?: "Standard"
     }
-    private fun permissionLabel() = permissionProfiles.firstOrNull { it.id == selectedPermissionId }?.let(::permissionLabel)
+    private fun permissionLabel() = PermissionProfiles.menu(permissionProfiles).firstOrNull { it.id == selectedPermissionId }?.label
         ?: selectedPermissionId?.let(::profileTitle)
         ?: "Access"
-    private fun permissionLabel(profile: PermissionOption) = when {
-        isFullAccess(profile.id) -> "Full access"
-        profile.id.contains("guardian", true) -> "Approve for me"
-        profile.id.contains("workspace", true) -> "Ask for approval"
-        profile.id.contains("read", true) -> "Read only"
-        else -> profileTitle(profile.id)
-    }
-    private fun permissionDescription(profile: PermissionOption) = when {
-        isFullAccess(profile.id) -> "Unrestricted access to the internet and any file on your computer"
-        profile.id.contains("guardian", true) -> "Only ask for actions detected as potentially unsafe"
-        profile.id.contains("workspace", true) -> "Always ask to edit external files and use the internet"
-        profile.id.contains("read", true) -> profile.description
-        else -> profile.description
-    }
     private fun permissionIcon(id: String?) = when {
         isFullAccess(id) -> R.drawable.ic_codex_permission_full_access
         id?.contains("guardian", true) == true -> R.drawable.ic_codex_permission_guardian
@@ -1636,6 +1731,7 @@ class MainActivity : AppCompatActivity() {
         onCopyText = ::copyText,
         onOpenConnections = ::showConnectionManager,
         onEnableNotifications = ::enableNotifications,
+        onExportDiagnostics = ::showDiagnosticExport,
         onShowDiagnostics = {
             val client = connectedServerUrl?.let(connectionClients::get)
             runtimeDialog = RuntimeDialogState("Connection diagnostics", client?.diagnosticsSummary() ?: "Disconnected", listOf(
@@ -1659,7 +1755,7 @@ class MainActivity : AppCompatActivity() {
                 selectedEffort = it.defaultEffort; selectedServiceTier = it.defaultServiceTier; updateComposerLabels() }
         },
         onReasoningEffortChanged = { id -> if (models.firstOrNull { it.model == selectedModel }?.efforts?.any { it.id == id } == true) { selectedEffort = id; updateComposerLabels() } },
-        onPermissionModeChanged = { id -> if (permissionProfiles.any { it.id == id && it.allowed }) { selectedPermissionId = id; updateComposerLabels() } },
+        onPermissionModeChanged = { id -> if (PermissionProfiles.menu(permissionProfiles).any { it.id == id && it.enabled }) { selectedPermissionId = id; updateComposerLabels() } },
         onServiceTierChanged = { id -> if (id.isBlank() || models.firstOrNull { it.model == selectedModel }?.serviceTiers?.any { it.id == id } == true) { selectedServiceTier = id.ifBlank { null }; updateComposerLabels() } },
         onPlanModeChanged = { planMode = it },
         onTextChanged = { composerDraft = it.text; persistComposer() }
@@ -1708,6 +1804,7 @@ class MainActivity : AppCompatActivity() {
                     app.codexremote.android.ui.diagnostics.DiagnosticLogDialog(
                         report = report, onRefresh = ::refreshDiagnosticLog, onShare = ::shareDiagnosticLog,
                         onClear = { diagnosticLogs.clear { ok -> runOnUiThread {
+                            lastDiagnosticThreadState = null
                             if (!ok) toast("Could not clear diagnostic log")
                             if (diagnosticReport != null) refreshDiagnosticLog()
                         } } },
@@ -1724,20 +1821,63 @@ class MainActivity : AppCompatActivity() {
             if (!isDestroyed && !isFinishing && generation == diagnosticReadGeneration) diagnosticReport = report
         } }
     }
+    private fun recordDiagnosticThreadState(thread: JSONObject) {
+        val server = connectedServerUrl ?: return
+        if (thread.optString("id").isBlank()) return
+        val state = DiagnosticThreadState.capture(server, thread, liveTimelineStore.snapshots(thread.optString("id")),
+            turnRunning, server in connectedServerUrls, composerScope in submittingScopes,
+            listOfNotNull(tokenStore.load(server)))
+        val signature = state.toString()
+        if (signature != lastDiagnosticThreadState) {
+            lastDiagnosticThreadState = signature
+            diagnosticLogs.recordThreadState(state)
+        }
+    }
+
+    private fun showDiagnosticExport() {
+        runtimeDialog = RuntimeDialogState("Export logs",
+            "Create a ZIP with recent operation logs, app version and the state of up to 20 recently viewed tasks. " +
+                "Chat text, drafts, attachments and credentials are excluded. Logs may contain host names and paths. " +
+                "Save to your phone or choose an app to share with. Nothing is uploaded automatically.",
+            listOf(RuntimeDialogAction("Save ZIP") { exportDiagnosticBundle(false) },
+                RuntimeDialogAction("Share ZIP") { exportDiagnosticBundle(true) }, RuntimeDialogAction("Cancel") {}))
+    }
+
     private fun shareDiagnosticLog() {
-        diagnosticLogs.export { file -> runOnUiThread {
+        diagnosticReadGeneration++
+        diagnosticReport = null
+        showDiagnosticExport()
+    }
+
+    private fun exportDiagnosticBundle(share: Boolean) {
+        if (diagnosticExportBusy || pendingDiagnosticSave != null) { toast("Diagnostic export already in progress"); return }
+        currentThread?.let(::recordDiagnosticThreadState)
+        val context = JSONObject().put("versionName", BuildConfig.VERSION_NAME).put("versionCode", BuildConfig.VERSION_CODE)
+            .put("buildType", BuildConfig.BUILD_TYPE).put("androidVersion", android.os.Build.VERSION.RELEASE)
+            .put("apiLevel", android.os.Build.VERSION.SDK_INT).put("deviceModel", android.os.Build.MODEL)
+            .put("composerRunning", turnRunning).put("connected", connectedServerUrl in connectedServerUrls)
+            .put("pendingRpcCount", callbacks.size).put("submittingScopeCount", submittingScopes.size)
+        diagnosticExportBusy = true
+        toast("Preparing diagnostic bundle…")
+        diagnosticLogs.exportBundle(context) { file -> runOnUiThread {
+            diagnosticExportBusy = false
             if (isDestroyed || isFinishing) return@runOnUiThread
-            if (file == null) { toast("Could not export diagnostic log"); return@runOnUiThread }
+            if (file == null) { toast("Could not export diagnostic bundle"); return@runOnUiThread }
             runCatching {
-                val uri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.artifacts", file)
-                val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-                    type = "text/plain"
-                    putExtra(android.content.Intent.EXTRA_STREAM, uri)
-                    clipData = android.content.ClipData.newRawUri("Diagnostic log", uri)
-                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                if (share) {
+                    val uri = androidx.core.content.FileProvider.getUriForFile(this, "$packageName.artifacts", file)
+                    val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                        type = "application/zip"
+                        putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                        clipData = android.content.ClipData.newRawUri("Diagnostic bundle", uri)
+                        addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    startActivity(android.content.Intent.createChooser(intent, "Share diagnostic bundle"))
+                } else {
+                    pendingDiagnosticSave = file
+                    saveDiagnosticBundle.launch("codex-remote-diagnostics.zip")
                 }
-                startActivity(android.content.Intent.createChooser(intent, "Share diagnostic log"))
-            }.onFailure { toast("Could not share diagnostic log") }
+            }.onFailure { pendingDiagnosticSave = null; toast("Could not open diagnostic export") }
         } }
     }
     private fun showInfo(title: String, message: String, actions: List<RuntimeDialogAction> = listOf(RuntimeDialogAction("OK") {})) {
@@ -1831,6 +1971,7 @@ class MainActivity : AppCompatActivity() {
     }
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
+        pendingDiagnosticSave?.let { outState.putString("diagnosticSaveFile", it.name) }
         val drafts = JSONObject(pendingInteractionDrafts.toString())
         interactionsController.uiState.value?.activeKey?.let { key ->
             tokenStore.loadCredential(key.substringBefore('\u0000'))?.deviceId?.let { device ->
@@ -1976,13 +2117,18 @@ class MainActivity : AppCompatActivity() {
         updateConversationConnection(); renderCurrentTimelineFromEvents(thread); updateComposerPrimaryButton(); updateComposerLabels(); updateUsageButton()
         restoreSidebarIfReady()
     }
-    private fun applyThreadSnapshot(thread: JSONObject, clearLive: Boolean) {
+    private fun applyThreadSnapshot(thread: JSONObject, clearLive: Boolean, lifecycleRevision: Long = turnLifecycleRevision) {
         currentThread = thread
+        if (liveTimelineStore.reconcileThreadSnapshot(thread.optString("id"), thread, lifecycleRevision, turnLifecycleRevision)) {
+            turnRunning = threadIsRunning(thread) || composerScope in submittingScopes
+            updateComposerPrimaryButton()
+        }
         if (clearLive) liveAssistantText = ""
         updateConversationConnection(); renderCurrentTimelineFromEvents(thread)
     }
     private fun renderCurrentTimelineFromEvents(thread: JSONObject? = currentThread) {
         thread ?: return
+        recordDiagnosticThreadState(thread)
         val items = projectedTimeline(thread).toMutableList()
         if (liveAssistantText.isNotBlank()) items += TimelineItem("live", "Codex", liveAssistantText, TimelineItem.Kind.ASSISTANT)
         val turns = mutableMapOf<String, DeliveryTurn>()
@@ -2007,7 +2153,7 @@ class MainActivity : AppCompatActivity() {
         composerController.setModelOptions(models.map { ComposerOption(it.model, it.displayName) }, selectedModel)
         composerController.setEffortOptions(model?.efforts.orEmpty().map { ComposerOption(it.id, effortLabel(it.id), it.description) }, selectedEffort)
         composerController.setServiceTierOptions(listOf(ComposerOption("", "Standard")) + model?.serviceTiers.orEmpty().map { ComposerOption(it.id, it.name, it.description) }, selectedServiceTier)
-        composerController.setPermissionOptions(permissionProfiles.map { ComposerOption(it.id, permissionLabel(it), permissionDescription(it), it.allowed) }, selectedPermissionId)
+        composerController.setPermissionOptions(PermissionProfiles.menu(permissionProfiles).map { ComposerOption(it.id, it.label, it.description, it.enabled) }, selectedPermissionId)
         composerController.setPlanMode(planMode)
     }
     private fun updateUsageButton() {
@@ -2462,7 +2608,6 @@ private data class ModelOption(
     val isDefault: Boolean,
 )
 
-private data class PermissionOption(val id: String, val description: String, val allowed: Boolean)
 
 private data class UsageSnapshot(val totalTokens: Long, val contextWindow: Long?)
 

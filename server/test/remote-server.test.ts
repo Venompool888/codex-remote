@@ -85,11 +85,19 @@ async function connect(url: string, token: string): Promise<MessageQueue> {
 test("v2 requires negotiation, advertises capabilities, and accepts RPC after hello_ack", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "codex-remote-v2-test-"));
   const auth = new DeviceAuth(join(directory, "devices.json"));
+  const codex = new FakeCodex();
+  const originalCall = codex.call.bind(codex);
+  codex.call = async (method, params) => {
+    if (method === "permissionProfile/list") return {data: [{id: ":workspace", allowed: true}]};
+    if (method === "thread/start") return {thread: {id: "probe"}, approvalsReviewer: "auto_review"};
+    if (method === "thread/unsubscribe") return {};
+    return originalCall(method, params);
+  };
   const host = new RemoteHost({
     host: "127.0.0.1",
     port: 0,
     auth,
-    codex: new FakeCodex() as unknown as CodexAppServer,
+    codex: codex as unknown as CodexAppServer,
     authRecheckIntervalMs: 20,
   });
   const started = await host.start();
@@ -147,6 +155,13 @@ test("v2 requires negotiation, advertises capabilities, and accepts RPC after he
     credentialSource: null,
   });
   assert.equal(JSON.stringify(accountResult).includes("must-not-cross-host-boundary"), false);
+
+  connection.socket.send(JSON.stringify({type: "rpc", id: "permissions", method: "permissionProfile/list", params: {limit: 100}}));
+  const profiles = await connection.next();
+  assert.equal(profiles.type, "rpc_result");
+  const entries = (profiles.result as {data: Array<{id: string; allowed: boolean}>}).data;
+  assert.deepEqual(entries.map(entry => entry.id), [":workspace", "local:auto-review", "local:config"]);
+  assert.equal(entries.every(entry => entry.allowed), true);
 
   const statusResponse = await fetch(`${baseUrl}/v2/status`, {
     headers: { Authorization: `Bearer ${paired.token}` },

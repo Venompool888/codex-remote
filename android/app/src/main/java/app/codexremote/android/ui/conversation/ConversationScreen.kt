@@ -517,6 +517,7 @@ private fun ConversationHeader(
                 modifier = Modifier.background(AppColors.surfaceContainerHigh)
             ) {
                 listOf(
+                    "Export logs" to controller::exportDiagnostics,
                     "Task files" to controller::openArtifacts,
                     "Connections" to controller::openConnections,
                     "Enable notifications" to controller::enableNotifications,

@@ -18,7 +18,7 @@ class DiagnosticLogDeviceTest : InstrumentationTestCase() {
     private fun click(label: String) {
         var action: AccessibilityNodeInfo? = null
         instrumentation.awaitUi("clickable $label") { root ->
-            var node = root.uiDescendants().firstOrNull { it.text?.toString() == label }
+            var node = root.uiDescendants().firstOrNull { it.text?.toString() == label || it.contentDescription?.toString() == label }
             repeat(12) {
                 if (node?.isClickable == true) { action = node; return@awaitUi true }
                 node = node?.parent
@@ -70,21 +70,65 @@ class DiagnosticLogDeviceTest : InstrumentationTestCase() {
         } finally { instrumentation.runOnMainSync { activity.finish() } }
     }
 
+    fun testConversationMenuHasDirectExportEntry() {
+        var exports = 0
+        val controller = app.codexremote.android.presentation.conversation.ConversationController(onExportDiagnostics = { exports++ })
+        val activity = instrumentation.composeFixture {
+            app.codexremote.android.ui.conversation.ConversationScreen(controller, {})
+        }
+        try {
+            click("Thread options")
+            instrumentation.awaitUiText("Export logs")
+            click("Export logs")
+            assertEquals(1, exports)
+        } finally { instrumentation.runOnMainSync { activity.finish() } }
+    }
+
+    fun testExportOffersLocalSaveAndExplicitShare() {
+        val activity = instrumentation.startActivitySync(Intent(instrumentation.targetContext, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        try {
+            instrumentation.runOnMainSync {
+                MainActivity::class.java.getDeclaredMethod("showDiagnosticExport").apply { isAccessible = true }.invoke(activity)
+            }
+            instrumentation.awaitUiText("Save ZIP")
+            instrumentation.awaitUiText("Share ZIP")
+            instrumentation.awaitUiText("Nothing is uploaded automatically")
+            click("Cancel")
+        } finally { instrumentation.runOnMainSync { activity.finish() } }
+    }
+
     fun testExportIsReadableThroughProviderAndClearRemovesExportAndLogs() {
         val context = instrumentation.targetContext
         val logs = DiagnosticLogs.get(context)
         val cleared = CountDownLatch(1)
         logs.clear { assertTrue(it); cleared.countDown() }
         assertTrue(cleared.await(5, TimeUnit.SECONDS))
+        File(context.filesDir, "diagnostics/recent-threads.json").apply { parentFile?.mkdirs(); writeText("[{broken") }
         logs.record("rpc.rpc_error", "https://mac.example", "method=thread/start\nfailed to load configuration: Operation not permitted (os error 1)\nBearer diagnostic-test-token")
         var exported: File? = null
         val ready = CountDownLatch(1)
-        logs.export { exported = it; ready.countDown() }
+        logs.recordThreadState(org.json.JSONObject().put("server", "https://mac.example").put("threadId", "diagnostic-task"))
+        logs.exportBundle(org.json.JSONObject().put("composerRunning", true)) { exported = it; ready.countDown() }
         assertTrue(ready.await(5, TimeUnit.SECONDS))
         val file = exported ?: error("Export failed")
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.artifacts", file)
-        val text = context.contentResolver.openInputStream(uri)!!.bufferedReader().use { it.readText() }
+        val entries = mutableMapOf<String, String>()
+        java.util.zip.ZipInputStream(context.contentResolver.openInputStream(uri)!!).use { zip ->
+            var entry = zip.nextEntry
+            while (entry != null) {
+                entries[entry.name] = zip.readBytes().toString(Charsets.UTF_8)
+                zip.closeEntry()
+                entry = zip.nextEntry
+            }
+        }
+        assertEquals(4, entries.size)
+        assertTrue(entries.getValue("recent-threads.json").contains("diagnostic-task"))
+        assertTrue(org.json.JSONObject(entries.getValue("app-state.json")).getBoolean("composerRunning"))
+        val text = entries.getValue("diagnostic-log.txt")
         assertTrue(text.contains("Operation not permitted (os error 1)"))
+        assertTrue(text.contains("diagnostics.recent_state_recovered"))
+        assertTrue(text.contains("earlier task snapshots are unavailable"))
         assertFalse(text.contains("diagnostic-test-token"))
         val done = CountDownLatch(1)
         logs.clear { assertTrue(it); done.countDown() }

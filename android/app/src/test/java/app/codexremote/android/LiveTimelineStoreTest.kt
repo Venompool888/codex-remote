@@ -9,6 +9,127 @@ import org.junit.Test
 
 class LiveTimelineStoreTest {
     @Test
+    fun lateItemEventsCannotReactivateCompletedItemOrTurn() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID)))
+        val item = agent("answer", "final_answer", "Done")
+        recordCompleted(store, item)
+        store.record("item/agentMessage/delta", params(itemId = "answer", delta = "!"))
+        assertFalse(store.snapshots(THREAD_ID).getValue(TURN_ID).items.single().active)
+        store.record("turn/completed", params(turn = JSONObject().put("id", TURN_ID).put("status", "completed")))
+        store.record("item/started", params(item = item))
+        assertFalse(store.snapshots(THREAD_ID).getValue(TURN_ID).items.single().active)
+        store.record("item/fileChange/patchUpdated", params(itemId = "late-patch")
+            .put("changes", JSONArray().put(JSONObject().put("path", "/tmp/late.txt").put("diff", "+late"))))
+        assertEquals(1, store.snapshots(THREAD_ID).getValue(TURN_ID).items.size)
+        assertFalse(store.snapshots(THREAD_ID).getValue(TURN_ID).items.any {
+            it.phase?.lowercase() in setOf("inprogress", "in_progress", "running", "started")
+        })
+    }
+
+    @Test
+    fun interruptErrorAfterActualCompletionCannotRestoreCancelledTurn() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID)))
+        store.requestCancellation(THREAD_ID, TURN_ID)
+        store.record("turn/completed", params(turn = JSONObject().put("id", TURN_ID).put("status", "completed")))
+        store.clearCancellationRequest(THREAD_ID, TURN_ID, restoreRunning = true)
+        assertEquals(null, store.activeTurnId(THREAD_ID))
+        assertEquals("cancelled", store.snapshots(THREAD_ID).getValue(TURN_ID).status)
+    }
+
+    @Test
+    fun terminalSnapshotSettlesMissedCompletionWithoutDiscardingLiveItems() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID).put("status", "inProgress")))
+        recordCompleted(store, agent("answer", "final_answer", "Done"))
+        val snapshot = JSONObject().put("status", JSONObject().put("type", "idle"))
+            .put("turns", JSONArray().put(JSONObject().put("id", TURN_ID).put("status", "completed")))
+
+        store.reconcileThreadSnapshot(THREAD_ID, snapshot, 1, 1)
+
+        assertEquals(null, store.activeTurnId(THREAD_ID))
+        assertEquals("completed", store.snapshots(THREAD_ID).getValue(TURN_ID).status)
+        assertEquals("Done", store.snapshots(THREAD_ID).getValue(TURN_ID).items.single().text)
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID).put("status", "inProgress")))
+        assertEquals(null, store.activeTurnId(THREAD_ID))
+    }
+
+    @Test
+    fun idleSnapshotSettlesOmittedTurnButNewTurnKeepsItsOwnIdentity() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID)))
+        store.reconcileThreadSnapshot(THREAD_ID, JSONObject().put("status", JSONObject().put("type", "idle"))
+            .put("turns", JSONArray()), 1, 1)
+        assertEquals(null, store.activeTurnId(THREAD_ID))
+
+        store.record("turn/started", JSONObject().put("threadId", THREAD_ID)
+            .put("turn", JSONObject().put("id", "new-turn")))
+        assertEquals("new-turn", store.activeTurnId(THREAD_ID))
+    }
+
+    @Test
+    fun idleThreadStatusSettlesTurnWhoseRowStillSaysInProgress() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID)))
+        val snapshot = JSONObject().put("status", JSONObject().put("type", "idle"))
+            .put("turns", JSONArray().put(JSONObject().put("id", TURN_ID).put("status", "inProgress")))
+
+        store.reconcileThreadSnapshot(THREAD_ID, snapshot, 1, 1)
+
+        assertEquals(null, store.activeTurnId(THREAD_ID))
+        assertEquals("unknown", store.snapshots(THREAD_ID).getValue(TURN_ID).status)
+    }
+
+    @Test
+    fun idleSnapshotSettlesEveryCachedActiveTurn() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID)))
+        store.record("turn/started", JSONObject().put("threadId", THREAD_ID)
+            .put("turn", JSONObject().put("id", "second-turn")))
+
+        store.reconcileThreadSnapshot(THREAD_ID,
+            JSONObject().put("status", JSONObject().put("type", "idle")).put("turns", JSONArray()), 1, 1)
+
+        assertEquals(null, store.activeTurnId(THREAD_ID))
+        assertTrue(store.snapshots(THREAD_ID).values.all { it.status == "unknown" })
+    }
+
+    @Test
+    fun snapshotPredatingNewTurnCannotClearIt() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", JSONObject().put("threadId", THREAD_ID)
+            .put("turn", JSONObject().put("id", "new-turn")))
+        val oldIdleSnapshot = JSONObject().put("status", JSONObject().put("type", "idle"))
+            .put("turns", JSONArray())
+
+        assertFalse(store.reconcileThreadSnapshot(THREAD_ID, oldIdleSnapshot, 4, 5))
+        assertEquals("new-turn", store.activeTurnId(THREAD_ID))
+    }
+
+    @Test
+    fun noActiveInterruptResponseSettlesOnlyRequestedTurn() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID)))
+        store.requestCancellation(THREAD_ID, TURN_ID)
+        store.record("turn/started", JSONObject().put("threadId", THREAD_ID)
+            .put("turn", JSONObject().put("id", "new-turn")))
+        store.settleActiveTurn(THREAD_ID, TURN_ID)
+        assertEquals("unknown", store.snapshots(THREAD_ID).getValue(TURN_ID).status)
+        assertEquals("new-turn", store.activeTurnId(THREAD_ID))
+    }
+
+    @Test
+    fun interruptErrorAfterCompletionCannotResurrectTurn() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID)))
+        store.requestCancellation(THREAD_ID, TURN_ID)
+        store.record("turn/completed", params(turn = JSONObject().put("id", TURN_ID).put("status", "completed")))
+        store.clearCancellationRequest(THREAD_ID, TURN_ID, restoreRunning = false)
+        assertEquals(null, store.activeTurnId(THREAD_ID))
+    }
+
+    @Test
     fun canonicalLiveItemsRestoreAlternatingTimelineWhenHistoryOmitsTools() {
         val store = LiveTimelineStore()
         store.record("turn/started", params(turn = JSONObject()

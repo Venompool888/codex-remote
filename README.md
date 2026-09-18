@@ -10,7 +10,7 @@ variants of this same source, with separate on-device data. See the
 
 Remote is an Android-native client for Codex running on a Linux or macOS server. The server-side Remote Host manages `codex app-server --stdio`; it does not scrape terminal output and it never sends the server's Codex/OpenAI credentials to Android.
 
-This is an independent community client, not an official OpenAI product. Protocol v2, scoped device credentials, resumable attachments, remote skills/plugins/apps, and reconnect safety are implemented. Internet-facing Hosts require HTTPS/WSS; see the compatibility gates below and the [0.3.1 release notes](docs/releases/0.3.1.md).
+This is an independent community client, not an official OpenAI product. Protocol v2, scoped device credentials, resumable attachments, remote skills/plugins/apps, and reconnect safety are implemented. Internet-facing Hosts require HTTPS/WSS; see the compatibility gates below and the [0.3.2 release notes](docs/releases/0.3.2.md).
 
 ## License and commercial use
 
