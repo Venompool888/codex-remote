@@ -126,11 +126,11 @@ test('permission replies approve only the projected pending grant and restore ca
  const result={permissions:visible.permissions,scope:'turn'};
  assert.deepEqual(await a.permissionReply(params,result),{permissions:params.permissions,scope:'turn'});
  assert.deepEqual(await a.permissionReply(params,{permissions:{},scope:'turn'}),{permissions:{},scope:'turn'});
- await assert.rejects(b.permissionReply(params,result),/match/);
- await assert.rejects(a.permissionReply(params,{permissions:params.permissions,scope:'turn'}),/match/);
+ await assert.rejects(b.permissionReply(params,result),/exceeds the requested permissions/);
+ await assert.rejects(a.permissionReply(params,{permissions:params.permissions,scope:'turn'}),/exceeds the requested permissions/);
  await assert.rejects(a.permissionReply(params,{...result,scope:'session'}),/turn/);
  const other=await a.outbound({permissions:{fileSystem:{read:['/srv/private/other'],write:['/srv/private/project/out']},network:{enabled:true}}}) as any;
- await assert.rejects(a.permissionReply(params,{permissions:other.permissions,scope:'turn'}),/match/);
+ await assert.rejects(a.permissionReply(params,{permissions:other.permissions,scope:'turn'}),/exceeds the requested permissions/);
  assert.deepEqual((await a.permissionReply(params,{...result,extra:'ignored'})),{permissions:params.permissions,scope:'turn'});
  const keyed={permissions:{fileSystem:{'/srv/private/first/report':true,'/srv/private/second/report':false}},
    permissionsPathNames:{spoof:'bad'}};

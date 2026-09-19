@@ -1,4 +1,6 @@
 import type { DeviceScope } from "./auth.js";
+import { HOST_MANAGEMENT_WRITES } from "./host-management.js";
+import { WORKSPACE_MUTATION_WRITES, WORKSPACE_TEXT_WRITES_SUPPORTED } from "./workspace-mutations.js";
 
 export const REMOTE_PROTOCOL_VERSION = 2;
 export const MIN_REMOTE_PROTOCOL_VERSION = 1;
@@ -11,6 +13,37 @@ export const ALLOWED_CODEX_METHODS = new Set([
   "host/image/read",
   "host/image/upload",
   "host/account/status",
+  "host/account/usage",
+  "host/administration/status",
+  "host/account/login/start",
+  "host/account/login/cancel",
+  "host/account/logout",
+  "host/mcp/status",
+  "host/mcp/oauth/start",
+  "host/mcp/reload",
+  "host/plugin/catalog",
+  "host/plugin/install",
+  "host/plugin/uninstall",
+  "host/settings/read",
+  "host/settings/set",
+  "host/skill/setEnabled",
+  "host/thread/memoryMode/set",
+  "host/terminal/execute",
+  "host/terminal/write",
+  "host/terminal/resize",
+  "host/terminal/kill",
+  "host/terminal/list",
+  "host/workspace/files/search",
+  "host/workspace/file/read",
+  "host/file/readReference",
+  "host/mcp/resource/read",
+  "host/workspace/text/save",
+  "host/workspace/text/create",
+  "host/memory/reset",
+  "host/thread/backgroundTerminals/list",
+  "host/thread/backgroundTerminals/terminate",
+  "host/thread/backgroundTerminals/clean",
+  "host/git/diff",
   "host/apps/installed",
   "host/capabilities/list",
   "host/artifacts/list",
@@ -21,6 +54,23 @@ export const ALLOWED_CODEX_METHODS = new Set([
   "thread/fork",
   "thread/archive",
   "thread/unarchive",
+  "thread/delete",
+  "thread/name/set",
+  "thread/search",
+  "thread/searchOccurrences",
+  "thread/turns/list",
+  "thread/items/list",
+  "thread/compact/start",
+  "thread/goal/set",
+  "thread/goal/get",
+  "thread/goal/clear",
+  "review/start",
+  "thread/realtime/listVoices",
+  "thread/realtime/start",
+  "thread/realtime/appendAudio",
+  "thread/realtime/appendText",
+  "thread/realtime/appendSpeech",
+  "thread/realtime/stop",
   "turn/start",
   "turn/steer",
   "turn/interrupt",
@@ -75,7 +125,12 @@ export interface RemoteCapabilities {
   interactions: { userInput: boolean; elicitation: boolean; approvals: boolean; replay: boolean; acknowledgement: boolean; fileChangeReview: boolean };
   skills: { list: boolean; changedEvents: boolean };
   plugins: { installedApps: boolean; experimentalList: boolean };
-  account: { status: boolean; remoteLogin: boolean };
+  account: { status: boolean; usage: boolean; remoteLogin: boolean };
+  workspaceFiles: { search: boolean; read: boolean; maxReadBytes: number };
+  richResources: { opaqueFileReferences: boolean; mcpRead: boolean; guardianDeniedApproval: boolean };
+  workspaceMutations: { textSave: boolean; memoryReset: boolean; backgroundTerminals: boolean };
+  git: { diff: boolean; maxDiffBytes: number };
+  administration: { status: boolean; authFlows: boolean; mcp: boolean; plugins: boolean; namedSettings: boolean; terminalControl: boolean };
   auth: {
     deviceBearer: boolean;
     expires: boolean;
@@ -164,7 +219,8 @@ export function negotiateProtocolVersion(clientVersions: readonly number[]): num
 export function currentRemoteCapabilities(options: { chunkedHttp?: boolean; installedApps?: boolean; artifacts?: boolean } = {}): RemoteCapabilities {
   return {
     rpcMethods: [...ALLOWED_CODEX_METHODS].filter((method) => (method !== "host/artifacts/list" || options.artifacts === true) &&
-      (method !== "host/image/read" || options.artifacts !== true)).sort(),
+      (method !== "host/image/read" || options.artifacts !== true) &&
+      (!["host/workspace/text/save", "host/workspace/text/create"].includes(method) || WORKSPACE_TEXT_WRITES_SUPPORTED)).sort(),
     attachments: {
       imageBase64: true,
       chunkedHttp: options.chunkedHttp === true,
@@ -179,23 +235,42 @@ export function currentRemoteCapabilities(options: { chunkedHttp?: boolean; inst
         // Generic provider MIME types still require a supported extension and valid content.
         "application/octet-stream",
         "application/pdf",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/zip",
         "application/x-zip-compressed",
         "image/gif",
         "image/jpeg",
         "image/png",
         "image/webp",
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/mp4",
+        "audio/ogg",
+        "audio/wav",
+        "audio/x-m4a",
+        "audio/x-wav",
+        "video/mp4",
+        "video/quicktime",
+        "video/webm",
         "text/*",
       ],
       maxFilesPerTurn: 4,
       maxBytesPerFile: 20 * 1024 * 1024,
-      maxBytesByKind: {image:20*1024*1024,pdf:20*1024*1024,archive:20*1024*1024,text:5*1024*1024,code:5*1024*1024},
+      maxBytesByKind: {image:20*1024*1024,pdf:20*1024*1024,archive:20*1024*1024,document:20*1024*1024,
+        audio:20*1024*1024,video:20*1024*1024,text:5*1024*1024,code:5*1024*1024},
     },
     events: { sequenced: true, replay: true },
     interactions: { userInput: true, elicitation: true, approvals: true, replay: true, acknowledgement: true, fileChangeReview: true },
     skills: { list: true, changedEvents: true },
     plugins: { installedApps: options.installedApps === true, experimentalList: true },
-    account: { status: true, remoteLogin: false },
+    account: { status: true, usage: true, remoteLogin: true },
+    workspaceFiles: { search: true, read: true, maxReadBytes: 512 * 1024 },
+    richResources: { opaqueFileReferences: true, mcpRead: true, guardianDeniedApproval: false },
+    workspaceMutations: { textSave: WORKSPACE_TEXT_WRITES_SUPPORTED, memoryReset: true, backgroundTerminals: true },
+    git: { diff: true, maxDiffBytes: 1024 * 1024 },
+    administration: { status: true, authFlows: true, mcp: true, plugins: true, namedSettings: true, terminalControl: true },
     auth: {
       deviceBearer: true,
       expires: true,
@@ -208,11 +283,14 @@ export function currentRemoteCapabilities(options: { chunkedHttp?: boolean; inst
 }
 
 export function requiredScopeForMethod(method: string): DeviceScope {
+  if (HOST_MANAGEMENT_WRITES.has(method)) return "rpc:write";
+  if (WORKSPACE_MUTATION_WRITES.has(method)) return "rpc:write";
   if (method === "host/workspace/migrate") return "rpc:write";
   if (method === "host/image/upload") return "attachments:write";
   if (method === "host/image/read") return "attachments:read";
-  if (method.startsWith("turn/")
-    || ["thread/start", "thread/resume", "thread/fork", "thread/archive", "thread/unarchive"].includes(method)) {
+  if (method.startsWith("turn/") || (method.startsWith("thread/realtime/") && method !== "thread/realtime/listVoices")
+    || ["thread/start", "thread/resume", "thread/fork", "thread/archive", "thread/unarchive", "thread/delete",
+      "thread/name/set", "thread/compact/start", "thread/goal/set", "thread/goal/clear", "review/start"].includes(method)) {
     return "rpc:write";
   }
   return "rpc:read";

@@ -20,7 +20,7 @@ sealed interface InlineMarkdownNode {
 }
 
 object InlineMarkdownParser {
-    private val token = Regex("`([^`]+)`|\\*\\*([^*]+)\\*\\*|(?<!!)\\[([^]]+)]\\(((?:https?|remote-artifact)://[^)]+)\\)")
+    private val token = Regex("`([^`]+)`|\\*\\*([^*]+)\\*\\*|(?<!!)\\[([^]]+)]\\(((?:https?|remote-artifact|remote-file|codex)://[^)]+)\\)")
 
     fun parse(source: String): List<InlineMarkdownNode> = buildList {
         var cursor = 0

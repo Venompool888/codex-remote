@@ -9,7 +9,7 @@ import test from "node:test";
 import WebSocket from "ws";
 import { DeviceAuth } from "../src/auth.js";
 import type { CodexAppServer } from "../src/codex-app-server.js";
-import { projectAccountStatus, projectInstalledApps, RemoteHost } from "../src/remote-server.js";
+import { projectAccountStatus, projectAccountUsage, projectInstalledApps, RemoteHost } from "../src/remote-server.js";
 import { AttachmentStore } from "../src/attachment-store.js";
 
 class FakeCodex extends EventEmitter {
@@ -155,6 +155,16 @@ test("v2 requires negotiation, advertises capabilities, and accepts RPC after he
     credentialSource: null,
   });
   assert.equal(JSON.stringify(accountResult).includes("must-not-cross-host-boundary"), false);
+
+  connection.socket.send(JSON.stringify({ type: "rpc", id: "administration", method: "host/administration/status", params: {} }));
+  const administration = await connection.next();
+  assert.deepEqual(administration.result, {
+    auth: { status: "browser_or_device_flow", apiKeysAccepted: false },
+    mcp: { status: "oauth_and_reload" },
+    plugins: { status: "catalog_install_uninstall", localPathsAccepted: false },
+    config: { status: "named_settings_only", settings: ["web_search", "model_verbosity", "model_reasoning_summary"] },
+    terminal: { status: "device_scoped", arbitraryEnvironmentAccepted: false },
+  });
 
   connection.socket.send(JSON.stringify({type: "rpc", id: "permissions", method: "permissionProfile/list", params: {limit: 100}}));
   const profiles = await connection.next();
@@ -389,6 +399,20 @@ test("account projection drops unknown and credential-bearing fields", () => {
     planType: null,
     credentialSource: null,
   });
+});
+
+test("account usage projection keeps quota data, isolates support failures, and drops credentials", () => {
+  const result = projectAccountUsage(
+    { status: "fulfilled", value: { rateLimits: { limitId: "codex", primary: { usedPercent: 42, resetsAt: 123 }, token: "secret" },
+      rateLimitsByLimitId: { codex: { limitId: "codex", secondary: { usedPercent: 7 } } }, accessToken: "secret" } },
+    { status: "rejected", reason: new Error("Method not found (-32601)") },
+  );
+  assert.deepEqual(result, {
+    rateLimits: { supported: true, data: { rateLimits: { limitId: "codex", primary: { usedPercent: 42, resetsAt: 123 } },
+      rateLimitsByLimitId: { codex: { limitId: "codex", secondary: { usedPercent: 7 } } } } },
+    tokenUsage: { supported: false, error: "Account token usage is unavailable on this Codex version" },
+  });
+  assert.equal(JSON.stringify(result).includes("secret"), false);
 });
 
 test("replays missed events in the same Host session and deduplicates write RPCs", async (t) => {

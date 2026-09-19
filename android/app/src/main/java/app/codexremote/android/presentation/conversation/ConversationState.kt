@@ -27,5 +27,10 @@ data class ConversationUiState(
     val tokenUsagePercent: Int = 0,
     val totalTokens: Long? = null,
     val contextWindow: Long? = null,
-    val showUsagePopup: Boolean = false
+    val showUsagePopup: Boolean = false,
+    val historyPagingUiReady: Boolean = false,
+    val canBrowseSubagents: Boolean = false,
+    val hasOlderHistory: Boolean = false,
+    val loadingOlderHistory: Boolean = false,
+    val historyPageError: String? = null,
 )

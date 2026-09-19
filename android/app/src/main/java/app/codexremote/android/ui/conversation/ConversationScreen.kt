@@ -70,6 +70,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -93,6 +95,7 @@ fun ConversationScreen(
     modifier: Modifier = Modifier
 ) {
     val state = controller.uiState.value
+    SubagentViewer(controller.subagents)
     val imageScope = LocalRemoteImageScope.current
     var threadMenuExpanded by remember { mutableStateOf(false) }
     val seenItemIds = remember(imageScope, state.threadId) { state.items.map { it.id }.toMutableSet() }
@@ -116,6 +119,8 @@ fun ConversationScreen(
                 threadMenuExpanded = threadMenuExpanded,
                 onThreadMenuToggle = { threadMenuExpanded = it }
             )
+
+            SubagentStrip(state.items, controller.subagents, onBrowseAll = if (state.canBrowseSubagents) controller::openSubagentDirectory else null)
 
             // Timeline items
             Box(
@@ -478,10 +483,16 @@ private fun ConversationHeader(
         if (state.tokenUsagePercent > 0) {
             Box(
                 modifier = Modifier
-                    .size(36.dp)
-                    .clip(RoundedCornerShape(18.dp))
-                    .clickable { controller.toggleUsagePopup() }
-                    .padding(8.dp),
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .clickable(
+                        role = Role.Button,
+                        onClickLabel = "Open context usage"
+                    ) { controller.toggleUsagePopup() }
+                    .semantics {
+                        role = Role.Button
+                        contentDescription = "Token usage ${state.tokenUsagePercent}%, open context usage"
+                    },
                 contentAlignment = Alignment.Center
             ) {
                 val primaryColor = AppColors.primary

@@ -4,7 +4,7 @@ import { createReadStream } from "node:fs";
 import { mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join } from "node:path";
 
-export type AttachmentKind = "image" | "pdf" | "text" | "code" | "archive";
+export type AttachmentKind = "image" | "pdf" | "text" | "code" | "archive" | "document" | "audio" | "video";
 export type AttachmentStatus = "uploading" | "complete";
 
 export interface AttachmentDescriptor {
@@ -61,6 +61,18 @@ const CODE_APPLICATION_MIMES: Record<string, readonly string[]> = {
   ".yml": ["application/yaml", "application/x-yaml"],
 };
 const IMAGE_MIMES = new Set(["image/gif", "image/jpeg", "image/png", "image/webp"]);
+const OFFICE_MIMES: Record<string, string> = {
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+};
+const AUDIO_MIMES: Record<string, readonly string[]> = {
+  ".mp3": ["audio/mpeg", "audio/mp3"], ".wav": ["audio/wav", "audio/x-wav"],
+  ".ogg": ["audio/ogg"], ".m4a": ["audio/mp4", "audio/x-m4a"],
+};
+const VIDEO_MIMES: Record<string, readonly string[]> = {
+  ".mp4": ["video/mp4"], ".mov": ["video/quicktime"], ".webm": ["video/webm"],
+};
 
 export class AttachmentStore {
   createOutboundStream(): StreamingReplacement {
@@ -376,13 +388,16 @@ function normalizeMime(value: unknown): string {
 function classify(name: string, mimeType: string): AttachmentKind {
   const extension = extname(name).toLowerCase();
   if (extension === ".zip" && ["application/zip", "application/x-zip-compressed", "application/octet-stream"].includes(mimeType)) return "archive";
+  if (OFFICE_MIMES[extension] === mimeType) return "document";
+  if (AUDIO_MIMES[extension]?.includes(mimeType)) return "audio";
+  if (VIDEO_MIMES[extension]?.includes(mimeType)) return "video";
   if (IMAGE_MIMES.has(mimeType)) return "image";
   if (mimeType === "application/pdf" && extension === ".pdf") return "pdf";
   if (CODE_EXTENSIONS.has(extension) && (mimeType.startsWith("text/") || mimeType === "application/octet-stream"
     || CODE_APPLICATION_MIMES[extension]?.includes(mimeType))) return "code";
   if (TEXT_EXTENSIONS.has(extension) && (mimeType.startsWith("text/")
     || ["application/json", "application/octet-stream"].includes(mimeType))) return "text";
-  throw new Error("Unsupported attachment type; use PNG, JPEG, GIF, WebP, PDF, ZIP, text, or source-code files");
+  throw new Error("Unsupported attachment type; use supported images, PDF, ZIP, Office, audio, video, text, or source-code files");
 }
 
 async function validateFile(record: AttachmentRecord): Promise<void> {
@@ -393,7 +408,7 @@ async function validateFile(record: AttachmentRecord): Promise<void> {
     if (detected !== record.mimeType) throw new Error("Image content does not match its MIME type");
   } else if (record.kind === "pdf") {
     if (bytes.subarray(0, 5).toString("ascii") !== "%PDF-") throw new Error("PDF signature is invalid");
-  } else if (record.kind === "archive") {
+  } else if (record.kind === "archive" || record.kind === "document") {
     // Transport only: never extract uploaded archives on the HTTP server.
     const signature = bytes.subarray(0, 4).toString("hex");
     if (bytes.length < 22 || !["504b0304", "504b0506"].includes(signature)) throw new Error("ZIP signature is invalid");
@@ -403,6 +418,17 @@ async function validateFile(record: AttachmentRecord): Promise<void> {
     }
     if (end < 0 || bytes.readUInt16LE(end + 4) !== 0 || bytes.readUInt16LE(end + 6) !== 0
       || bytes.readUInt32LE(end + 16) + bytes.readUInt32LE(end + 12) > end) throw new Error("ZIP directory is invalid or unsupported");
+    if (record.kind === "document") {
+      const marker = extname(record.name).toLowerCase() === ".docx" ? "word/"
+        : extname(record.name).toLowerCase() === ".xlsx" ? "xl/" : "ppt/";
+      if (!bytes.includes(Buffer.from("[Content_Types].xml")) || !bytes.includes(Buffer.from(marker))) {
+        throw new Error("Office document structure is invalid");
+      }
+    }
+  } else if (record.kind === "audio") {
+    if (!validAudio(bytes, record.mimeType)) throw new Error("Audio content does not match its MIME type");
+  } else if (record.kind === "video") {
+    if (!validVideo(bytes, record.mimeType)) throw new Error("Video content does not match its MIME type");
   } else {
     if (bytes.includes(0)) throw new Error("Text attachment contains binary data");
     try {
@@ -414,6 +440,20 @@ async function validateFile(record: AttachmentRecord): Promise<void> {
       try { JSON.parse(bytes.toString("utf8")); } catch { throw new Error("JSON attachment is invalid"); }
     }
   }
+}
+
+function validAudio(bytes: Buffer, mime: string): boolean {
+  if (mime === "audio/mpeg" || mime === "audio/mp3") return bytes.subarray(0, 3).toString("ascii") === "ID3"
+    || (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0);
+  if (mime === "audio/wav" || mime === "audio/x-wav") return bytes.subarray(0, 4).toString("ascii") === "RIFF"
+    && bytes.subarray(8, 12).toString("ascii") === "WAVE";
+  if (mime === "audio/ogg") return bytes.subarray(0, 4).toString("ascii") === "OggS";
+  return (mime === "audio/mp4" || mime === "audio/x-m4a") && bytes.subarray(4, 8).toString("ascii") === "ftyp";
+}
+
+function validVideo(bytes: Buffer, mime: string): boolean {
+  if (mime === "video/webm") return bytes.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+  return (mime === "video/mp4" || mime === "video/quicktime") && bytes.subarray(4, 8).toString("ascii") === "ftyp";
 }
 
 function detectImageMime(bytes: Buffer): string | null {

@@ -70,8 +70,9 @@ The first valid authenticated device response wins. The current Android prototyp
 
 ## Allow-listed methods
 
-- `thread/list`, `thread/read`, `thread/start`, `thread/resume`, `thread/fork`
-- `thread/archive`, `thread/unarchive`
+- `thread/list`, `thread/search`, `thread/searchOccurrences`, `thread/read`, `thread/turns/list`, `thread/items/list`
+- `thread/start`, `thread/resume`, `thread/fork`, `thread/archive`, `thread/unarchive`, `thread/delete`, `thread/name/set`
+- `thread/compact/start`, `thread/goal/set`, `thread/goal/get`, `thread/goal/clear`, `review/start`
 - `turn/start`, `turn/steer`, `turn/interrupt`
 - `model/list`, `collaborationMode/list`, `permissionProfile/list`
 - `skills/list`, `plugin/list` (read-only discovery for composer mentions)
@@ -79,7 +80,17 @@ The first valid authenticated device response wins. The current Android prototyp
 - `host/workspace/list` (authenticated, read-only child-directory listing used by the remote project picker)
 - `host/image/read` (authenticated image-only read, limited to the configured workspace and OS temporary directories, with a 12 MB cap and magic-byte validation)
 - `host/account/status` (v2 safe projection of Host-side Codex authentication state; never includes tokens or API keys)
+- `host/account/usage` (v2 quota/token-usage projection; each upstream section reports `supported` or a version-aware error independently)
+- `host/administration/status` (read-only declaration of the narrow account, MCP, plugin, named-setting, and device-owned terminal surfaces)
+- `host/workspace/files/search`, `host/workspace/file/read` (one validated workspace root, relative results, at most 200 search results and 512 KiB UTF-8 reads; symlink escapes and binary files are rejected)
+- `host/file/readReference` (resolves a task-scoped `remote-file://` reference against the task's current authoritative workspace and returns relative path plus preserved start/end lines)
+- `host/mcp/resource/read` (bounded text/HTML/image/audio projection of the App Server's `mcpServer/resource/read`; credential-bearing and local-file URIs are rejected)
+- `host/workspace/text/save`, `host/workspace/text/create` (bounded UTF-8 writes under one validated workspace; save requires the exact prior SHA-256 and both require an exact path preview confirmation)
+- `host/memory/reset`, `host/thread/backgroundTerminals/list`, `host/thread/backgroundTerminals/terminate`, `host/thread/backgroundTerminals/clean` (typed App Server wrappers; mutations require exact action previews)
+- `host/git/diff` (one validated workspace root and at most 1 MiB of diff text)
 - `host/apps/installed` (v2 credential-free projection of the stable installed-app runtime snapshot; capability-gated)
+- Typed administration wrappers: `host/account/login/*`, `host/account/logout`, `host/mcp/*`, `host/plugin/*`, `host/settings/set`, `host/skill/setEnabled`, `host/thread/memoryMode/set`, and `host/terminal/*`
+- Experimental realtime methods: `thread/realtime/listVoices`, `thread/realtime/start`, `thread/realtime/appendAudio`, `thread/realtime/appendText`, `thread/realtime/appendSpeech`, `thread/realtime/stop`
 
 ## Protocol v2 attachments
 
@@ -87,11 +98,23 @@ When negotiated capabilities report `attachments.chunkedHttp: true`, use the aut
 
 Methods such as `thread/shellCommand`, raw `command/exec`, configuration writes, plugin installation, and account login are not exposed in protocol v1.
 
+Task mutation, context compaction, goal mutation and review start require `rpc:write` and a v2 idempotency key. Search, pagination, goal reads, account usage, bounded workspace reads and Git diff require `rpc:read`. Direct feature inputs are bounded before dispatch. Capability negotiation advertises only callable Remote methods; an older App Server can still reject a newly advertised upstream feature, and the Host returns that as an explicit unavailable/version error rather than fabricating support.
+
+Administrative wrappers use closed parameter schemas and require `rpc:write`, v2 idempotency, and exact action-preview confirmations for potentially destructive operations. Account login accepts only browser/device authorization flows; API keys and client-supplied tokens are rejected. Plugin installation accepts remote names, never local marketplace paths. Configuration changes are limited to three named presentation/search settings, skill enablement by name, and per-thread memory mode. Terminal commands use argv vectors in one validated workspace, bounded output/time/input, generated upstream process IDs, and device-bound control/output routing; environment and sandbox overrides are not accepted. Hosts return explicit unsupported/version errors when an upstream feature is absent.
+
+Workspace text save/create never expose a generic filesystem RPC. They are advertised only on Linux Hosts where descriptor-relative `/proc/self/fd` operations are available; other platforms reject them explicitly. Each parent is opened relative to an anchored workspace directory descriptor with no-follow checks. Content is limited to 512 KiB UTF-8, and create publishes a fully written file without replacing an existing entry. Save rejects symlinks and multiply-linked files, checks the expected lowercase SHA-256, then updates that same open descriptor while preserving its mode. The hash is optimistic conflict detection, not exclusion of unrelated external editors. Save is not an atomic replacement and a Host crash during the write can leave partial content. Background-terminal responses project only bounded identifiers, command text, workspace basename, and numeric process statistics; raw cwd and other upstream metadata are removed.
+
+Remote realtime accepts websocket transport only. Start may forward bounded `includeStartupContext`, `version` (`v1`/`v2`/`v3`), `model`, `prompt`, and V3-only `initialItems` (128 items and 8,192 conservatively estimated text tokens). Audio input is base64 PCM16LE, mono 24 kHz, at most 256 KiB per append with verified sample counts; remote text input is user-role only and bounded to 16,000 characters.
+
+Assistant-rendered workspace links, file citations, and code-comment file attributes can become task-scoped opaque `remote-file://` references after realpath containment checks. User messages and fenced code are never converted into actionable references. Outside-workspace and unavailable targets keep the generic artifact/unavailable fallback, and absolute Host paths remain subject to outbound routing/redaction. Guardian-denied notifications expose only a sanitized summary and `approvable:false`: the public completed notification does not contain the exact serialized `GuardianAssessmentEvent` required by `thread/approveGuardianDeniedAction`, so Remote deliberately does not advertise or reconstruct that mutation.
+
 ### Additive attachment presentation and failure details (2026-09-06)
 
 Attachment-backed user content may include `remoteAttachment: { id, name, kind }` metadata (`kind: image|file`), alongside legacy-readable text. Clients render cards separately from prompt text. When `attachments.restrictedImagePreview` is advertised, `GET /v2/attachments/:id/preview` requires `attachments:read` and a complete image owned by the authenticated device. It streams Content-Length and X-Content-SHA256 with no-store/nosniff. Missing/expired/other-device resources fail; raw filesystem paths are not accepted by this endpoint.
 
 ZIP MIME `application/zip` is now advertised; `.zip` with the common ZIP/octet-stream MIME variants is accepted as archive transport with signature/end-directory and complete SHA checks. No extraction occurs in the upload service. Attachment HTTP errors can include `code: unsupported_type|quota_exceeded|too_large|invalid_content|upload_failed`; older clients may ignore it. New clients map known codes to local text instead of exposing arbitrary response bodies.
+
+The endpoint also accepts validated DOCX/XLSX/PPTX, MP3/WAV/OGG/M4A and MP4/MOV/WebM attachments up to 20 MiB. Office files must be recognizable ZIP packages, and media must match a bounded signature check for its declared MIME type. These files remain private, device-owned transport inputs; the upload service never extracts or executes them, and model/tool support for interpreting a format can vary by Host version.
 
 Capability negotiation version `0` is transient/unknown in Android. Preserve a draft's previously confirmed durable-upload capability until negotiation returns an actual supported/unsupported result.
 

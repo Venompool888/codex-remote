@@ -18,6 +18,8 @@ import androidx.appcompat.app.AppCompatDelegate
 import androidx.compose.runtime.*
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.UriHandler
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import app.codexremote.android.compose.*
@@ -29,6 +31,11 @@ import app.codexremote.android.presentation.conversation.*
 import app.codexremote.android.presentation.interactions.*
 import app.codexremote.android.presentation.projects.*
 import app.codexremote.android.presentation.sidebar.*
+import app.codexremote.android.presentation.tasktools.*
+import app.codexremote.android.presentation.workspace.*
+import app.codexremote.android.presentation.realtime.*
+import app.codexremote.android.presentation.hosttools.*
+import app.codexremote.android.presentation.resources.*
 import app.codexremote.android.ui.CodexApp
 import app.codexremote.android.ui.projects.*
 import app.codexremote.android.ui.interactions.*
@@ -117,6 +124,12 @@ class MainActivity : AppCompatActivity() {
     private val callbackErrors = mutableMapOf<String, (String) -> Unit>()
     private val imageCache = object : LruCache<String, Bitmap>(24 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap) = value.byteCount
+    }
+    private var pendingVoicePermission: ((Boolean) -> Unit)? = null
+    private val voicePermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val callback = pendingVoicePermission
+        pendingVoicePermission = null
+        callback?.invoke(granted && !isFinishing && !isDestroyed && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED))
     }
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startRemoteMonitor() else toast("Notifications are off; keep Remote open to see task requests")
@@ -217,8 +230,11 @@ class MainActivity : AppCompatActivity() {
     private var pendingProject: RemoteProject? = null
     private var pendingDraftProject: RemoteProject? = null
     private var refreshScheduled = false
-    private var refreshInFlight = false
-    private var refreshAgain = false
+    private val historyWindow = ThreadHistoryWindow()
+    private var historyPagingRejected = false
+    private var showSubagentDirectory by mutableStateOf(false)
+    private var historyPageInFlight = false
+    private val conversationRefreshGate = ConversationRefreshGate()
     private var clearLiveOnNextRefresh = false
     private val refreshRunnable = Runnable {
         refreshScheduled = false
@@ -341,6 +357,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        realtimeController.onPause()
         persistComposer()
         super.onStop()
     }
@@ -533,6 +550,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun onDisconnected(serverUrl: String, reason: String) = runOnUiThread {
         if (isDestroyed || isFinishing) return@runOnUiThread
+        conversationRefreshGate.connectionChanged(serverUrl)
         diagnosticLogs.record("connection.disconnected", serverUrl, reason, listOfNotNull(tokenStore.load(serverUrl)))
         capabilityPresentationCache.invalidateServer(serverUrl)
         connectionFailureReasons[serverUrl] = reason
@@ -545,7 +563,13 @@ class MainActivity : AppCompatActivity() {
             projectsController.showError(reason)
         }
         if (serverUrl == connectedServerUrl) {
-
+            taskToolsController.reset()
+            hostToolsController.setScope(null, emptySet())
+            workspaceMutationController.setScope(null, emptySet())
+            showSubagentDirectory = false
+            richResourcesController.reset()
+            workspaceToolsController.reset()
+            realtimeController.setScope(null, emptySet())
             if (currentThread == null) restoreOfflineDraft(serverUrl)
             // Losing the transport does not fail a task still executing on its host.
             updateConversationConnection()
@@ -782,6 +806,23 @@ class MainActivity : AppCompatActivity() {
 
     private fun resetConversationState() {
         pendingDraftProject = null
+        conversationController.subagents.close()
+        taskToolsController.reset()
+        val host = connectedServerUrl?.takeIf { it in connectedServerUrls }
+        val device = host?.let { tokenStore.loadCredential(it)?.deviceId }
+        hostToolsController.setScope(
+            if (host != null && device != null) HostToolsScope(host, device, "", null) else null,
+            host?.let { connectionClients[it]?.advertisedRpcMethods() }.orEmpty(),
+        )
+        workspaceMutationController.setScope(null, emptySet())
+        richResourcesController.reset()
+        workspaceToolsController.reset()
+        realtimeController.setScope(null, emptySet())
+        showSubagentDirectory = false
+        historyWindow.reset()
+        historyPagingRejected = false
+        historyPageInFlight = false
+        conversationController.setHistoryPaging(false)
         navigationRequests.invalidate()
         catalogController.closeCatalog()
         artifactsController.closeArtifacts()
@@ -789,8 +830,7 @@ class MainActivity : AppCompatActivity() {
         artifactRecords.clear()
         threadLoadError = null
         conversationController.setLoading(false)
-        refreshInFlight = false
-        refreshAgain = false
+        conversationRefreshGate.reset()
         clearLiveOnNextRefresh = false
         persistComposer()
         composerScope = null
@@ -845,14 +885,13 @@ class MainActivity : AppCompatActivity() {
         main.postDelayed({
             if (navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId) && conversationController.isThreadLoadPending) {
                 navigationRequests.invalidate()
-                refreshInFlight = false
-                refreshAgain = false
+                conversationRefreshGate.reset()
                 threadLoadError = "Loading took too long. Check your connection and try again."
                 conversationController.failThreadLoad(threadLoadError!!)
             }
         }, 30_000L)
         val lifecycleRevision = turnLifecycleRevision
-        rpc("thread/resume", JSONObject().put("threadId", threadId), { error ->
+        rpc("thread/resume", JSONObject().put("threadId", threadId).apply { if (usesPagedHistory()) put("excludeTurns", true) }, { error ->
             if (navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId)) {
                 threadLoadError = if (error.contains("no rollout found", ignoreCase = true))
                     "This task is no longer available on this host. Choose another task, or retry after reconnecting."
@@ -901,25 +940,22 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshCurrentThread() {
         val threadId = currentThreadId ?: return
-        if (refreshInFlight) {
-            refreshAgain = true
-            return
-        }
-        refreshInFlight = true
+        val serverUrl = connectedServerUrl ?: return
+        val refreshTicket = conversationRefreshGate.begin(serverUrl, threadId) ?: return
         val ticket = navigationRequests.capture(connectedServerUrl, threadId)
         val lifecycleRevision = turnLifecycleRevision
         val clearLive = clearLiveOnNextRefresh
         clearLiveOnNextRefresh = false
-        rpc("thread/read", JSONObject().put("threadId", threadId).put("includeTurns", true), { error ->
-            if (!navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId)) return@rpc
-            refreshInFlight = false
+        readConversationSnapshot(threadId, { conversationRefreshGate.isCurrent(refreshTicket) }, { error ->
+            if (!conversationRefreshGate.complete(refreshTicket)) return@readConversationSnapshot
+            if (!navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId)) return@readConversationSnapshot
             if (conversationController.isThreadLoadPending) {
                 conversationController.failThreadLoad("Couldn't load the conversation history. Please try again.")
             } else toast(error)
             scheduleFollowUpRefreshIfNeeded()
         }) { result ->
-            if (!navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId)) return@rpc
-            refreshInFlight = false
+            if (!conversationRefreshGate.complete(refreshTicket)) return@readConversationSnapshot
+            if (!navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId)) return@readConversationSnapshot
             val thread = result.optJSONObject("thread")
             if (thread != null && thread.optString("id") == threadId) {
                 if (lifecycleRevision == turnLifecycleRevision) {
@@ -937,9 +973,73 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Enable only with the AGY history navigation surface; keep complete legacy history visible meanwhile.
+    private fun usesPagedHistory(): Boolean = conversationController.uiState.value.historyPagingUiReady && !historyPagingRejected &&
+        connectedServerUrl?.let { "thread/turns/list" in connectionClients[it]?.advertisedRpcMethods().orEmpty() } == true
+
+    private fun readConversationSnapshot(
+        threadId: String,
+        isCurrent: () -> Boolean,
+        onError: (String) -> Unit,
+        done: (JSONObject) -> Unit,
+    ) {
+        if (!usesPagedHistory()) {
+            rpc("thread/read", JSONObject().put("threadId", threadId).put("includeTurns", true), onError, done)
+            return
+        }
+        val ticket = navigationRequests.capture(connectedServerUrl, threadId)
+        rpc("thread/read", JSONObject().put("threadId", threadId).put("includeTurns", false), onError) { result ->
+            if (!isCurrent()) return@rpc
+            if (!navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId)) return@rpc
+            val thread = result.optJSONObject("thread") ?: return@rpc onError("No task metadata returned")
+            rpc("thread/turns/list", JSONObject().put("threadId", threadId).put("limit", 20)
+                .put("sortDirection", "desc").put("itemsView", "full"), { error ->
+                if (!isCurrent()) return@rpc
+                if (!navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId)) return@rpc
+                if (error.contains("method", true) || error.contains("unsupported", true) || error.contains("unavailable", true)) {
+                    historyPagingRejected = true
+                    historyWindow.reset()
+                    conversationController.setHistoryPaging(false)
+                    readConversationSnapshot(threadId, isCurrent, onError, done)
+                } else onError(error)
+            }) page@ { page ->
+                if (!isCurrent()) return@page
+                if (!navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId)) return@page
+                val turns = page.optJSONArray("data") ?: return@page onError("No history page returned")
+                val cursor = page.optString("nextCursor").takeUnless { it.isBlank() || it == "null" }
+                thread.put("turns", historyWindow.mergeDescendingPage(turns, cursor, false))
+                conversationController.setHistoryPaging(historyWindow.nextCursor != null, historyPageInFlight)
+                done(result)
+            }
+        }
+    }
+
+    private fun loadOlderConversationHistory() {
+        val id = currentThreadId ?: return
+        val cursor = historyWindow.nextCursor ?: return
+        if (!usesPagedHistory() || historyPageInFlight) return
+        val ticket = navigationRequests.capture(connectedServerUrl, id)
+        historyPageInFlight = true
+        conversationController.setHistoryPaging(true, true)
+        rpc("thread/turns/list", JSONObject().put("threadId", id).put("cursor", cursor).put("limit", 20)
+            .put("sortDirection", "desc").put("itemsView", "full"), { error ->
+            if (!navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId)) return@rpc
+            historyPageInFlight = false
+            conversationController.setHistoryPaging(true, error = error)
+        }) { page ->
+            if (!navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId)) return@rpc
+            historyPageInFlight = false
+            val turns = page.optJSONArray("data")
+            if (turns == null) { conversationController.setHistoryPaging(true, error = "No history page returned"); return@rpc }
+            val next = page.optString("nextCursor").takeUnless { it.isBlank() || it == "null" }
+            currentThread?.put("turns", historyWindow.mergeDescendingPage(turns, next, true))
+            conversationController.setHistoryPaging(next != null)
+            renderCurrentTimelineFromEvents()
+        }
+    }
+
     private fun scheduleFollowUpRefreshIfNeeded() {
-        if (!refreshAgain) return
-        refreshAgain = false
+        if (!conversationRefreshGate.consumeFollowUp()) return
         scheduleRefresh()
     }
 
@@ -1104,7 +1204,7 @@ class MainActivity : AppCompatActivity() {
             if (it.moveToFirst()) it.getString(0) else null
         } }.getOrNull().orEmpty().ifBlank { "attachment" }
         val mime = runCatching { contentResolver.getType(uri) }.getOrNull()
-            ?.substringBefore(';')?.lowercase(Locale.ROOT) ?: inferredAttachmentMime(name)
+            ?.substringBefore(';')?.lowercase(Locale.ROOT)?.takeUnless { it == "application/octet-stream" } ?: inferredAttachmentMime(name)
         val pending = ComposerAttachment("remoteAttachment", name, "", "Preparing").toJson()
             .put("sourceUri", uri.toString()).put("mimeType", mime).put("state", "preparing")
         synchronized(draftStore) {
@@ -1127,6 +1227,16 @@ class MainActivity : AppCompatActivity() {
         "gif" -> "image/gif"
         "webp" -> "image/webp"
         "pdf" -> "application/pdf"
+        "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        "mp3" -> "audio/mpeg"
+        "wav" -> "audio/wav"
+        "ogg" -> "audio/ogg"
+        "m4a" -> "audio/mp4"
+        "mp4" -> "video/mp4"
+        "mov" -> "video/quicktime"
+        "webm" -> "video/webm"
         "json" -> "application/json"
         else -> "application/octet-stream"
     }
@@ -1294,6 +1404,72 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val steeringScopes = mutableSetOf<String>()
+
+    private fun steerActiveTurn(text: String, done: (Boolean) -> Unit) {
+        fun reject(message: String) { toast(message); done(false) }
+        val server = connectedServerUrl ?: return reject("Connect to a host first")
+        val threadId = currentThreadId ?: return reject("Open a running task first")
+        val scope = composerScope ?: return done(false)
+        val device = tokenStore.loadCredential(server)?.deviceId
+        val ticket = navigationRequests.capture(server, threadId)
+        val client = connectionClients[server]
+        if (server !in connectedServerUrls) return reject("Offline · your update is saved")
+        if (client?.supportsRpcMethod("turn/steer") != true) return reject("This host does not support running-task updates")
+        if (!turnRunning || scope in steeringScopes || scope in submittingScopes) return done(false)
+        val turnId = liveTimelineStore.activeTurnId(threadId) ?: snapshotRunningTurnId(threadId)
+            ?: return reject("Checking the active turn · try again shortly").also { refreshCurrentThread() }
+        val attachments = composerAttachments.toList()
+        if (text.isBlank() && attachments.isEmpty()) return done(false)
+        if (attachments.any { it.path.isBlank() }) return reject("Wait for attachments to finish uploading")
+        val input = JSONArray()
+        attachments.forEach { attachment ->
+            input.put(JSONObject().put("type", attachment.type).apply {
+                when (attachment.type) {
+                    "remoteAttachment" -> put("attachmentId", attachment.path).put("name", attachment.name)
+                    "remoteCapability" -> put("capabilityId", attachment.path)
+                    else -> { put("path", attachment.path); if (attachment.type != "localImage") put("name", attachment.name) }
+                }
+            })
+        }
+        if (text.isNotBlank()) input.put(JSONObject().put("type", "text").put("text", text))
+        val params = JSONObject().put("threadId", threadId).put("expectedTurnId", turnId).put("input", input)
+        params.put("_remoteWriteKey", durableWriteKey(scope, "steer", params.toString()))
+        steeringScopes += scope
+        fun accepts() = navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId) &&
+            tokenStore.loadCredential(server)?.deviceId == device && composerScope == scope
+        rpcOn(server, "turn/steer", params, { error ->
+            steeringScopes.remove(scope)
+            done(false)
+            if (accepts()) {
+                showInfo("Update was not confirmed", "$error\n\nYour draft is saved. The running task has not been interrupted.")
+                refreshCurrentThread()
+            }
+        }) {
+            steeringScopes.remove(scope)
+            if (tokenStore.loadCredential(server)?.deviceId == device) synchronized(draftStore) {
+                val saved = draftStore.read(scope)
+                saved.remove("steerKey"); saved.remove("steerFingerprint")
+                val savedIds = jsonObjects(saved.optJSONArray("attachments")).map { it.optString("localId") }
+                if (saved.optString("text") == text && savedIds == attachments.map { it.localId }) {
+                    saved.put("text", "").put("attachments", JSONArray())
+                }
+                draftStore.write(scope, saved)
+            }
+            if (accepts()) {
+                if (composerDraft == text && composerAttachments == attachments) {
+                    composerAttachments.clear()
+                    composerController.updateText("")
+                    persistComposer()
+                }
+                updateComposerPrimaryButton()
+                refreshCurrentThread()
+            }
+            // Runtime owns attachment removal and persistence; the controller only releases its pending state.
+            done(false)
+        }
+    }
+
     private fun interruptActiveTurn() {
         val threadId = currentThreadId ?: return
         val server = connectedServerUrl ?: return
@@ -1410,7 +1586,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleCodexEvent(message: JSONObject) {
         val params = message.optJSONObject("params") ?: JSONObject()
-        val eventThreadId = params.optString("threadId")
+        conversationController.subagents.consumeEvent(message.optString("method"), params)
+        connectedServerUrl?.let { hostToolsController.consumeEvent(it, message.optString("method"), params) }
+        val eventThreadId = params.optString("threadId").takeUnless { it == "null" }.orEmpty()
         if (eventThreadId.isNotBlank() && eventThreadId != currentThreadId) return
         val method = message.optString("method")
         val eventTurnId = params.optString("turnId").ifBlank { params.optJSONObject("turn")?.optString("id").orEmpty() }
@@ -1423,7 +1601,25 @@ class MainActivity : AppCompatActivity() {
             } == true else false
         if (eventTurnId.isNotBlank() && terminalInSnapshot) return
         if (method == "thread/status/changed" || method == "turn/started" || method in TURN_FINISHED_EVENTS) turnLifecycleRevision++
-        val liveTimelineChanged = liveTimelineStore.record(method, params)
+        richResourcesController.consumeEvent(params)
+        taskToolsController.consumeEvent(method, params)
+        realtimeController.consumeEvent(method, params)
+        if (method == "thread/settings/updated" && eventThreadId == currentThreadId) {
+            params.optJSONObject("threadSettings")?.let { settings ->
+                selectedModel = settings.optString("model").takeUnless { it.isBlank() || it == "null" }
+                selectedEffort = settings.optString("effort").takeUnless { it.isBlank() || it == "null" }
+                selectedServiceTier = settings.optString("serviceTier").takeUnless { it.isBlank() || it == "null" }
+                val permission = settings.optJSONObject("activePermissionProfile")?.optString("id")?.takeUnless { it.isBlank() || it == "null" }
+                selectedPermissionId = when {
+                    permission == PermissionProfiles.WORKSPACE && settings.optString("approvalsReviewer") == "auto_review" -> PermissionProfiles.AUTO_REVIEW
+                    permission == null -> PermissionProfiles.CUSTOM_CONFIG
+                    else -> permission
+                }
+                planMode = settings.optJSONObject("collaborationMode")?.optString("mode") == "plan"
+                updateComposerLabels()
+            }
+        }
+        val liveTimelineChanged = liveTimelineStore.record(method, params, scopedThreadId = currentThreadId)
         if (method == "thread/tokenUsage/updated") {
             val usage = params.optJSONObject("tokenUsage")
             val total = usage?.optJSONObject("last")?.optLong("totalTokens", -1L) ?: -1L
@@ -1445,7 +1641,16 @@ class MainActivity : AppCompatActivity() {
                 appendLiveAssistantDelta(params.optString("delta"))
             }
         } else if (method == "thread/status/changed") {
-            turnRunning = params.optJSONObject("status")?.optString("type") == "active"
+            val status = params.optJSONObject("status")
+            turnRunning = status?.optString("type") == "active"
+            val flags = status?.optJSONArray("activeFlags")
+            val activeFlags = if (flags == null) emptySet() else (0 until flags.length()).map { flags.optString(it) }.toSet()
+            conversationController.setThreadStatus(when {
+                "waitingOnApproval" in activeFlags -> "Waiting for approval"
+                "waitingOnUserInput" in activeFlags -> "Waiting for your input"
+                turnRunning -> "Running"
+                else -> status?.optString("type").orEmpty()
+            })
             if (!turnRunning && eventThreadId.isNotBlank()) liveTimelineStore.settleActiveTurn(eventThreadId)
             updateComposerPrimaryButton()
             requestThreads()
@@ -1732,6 +1937,8 @@ class MainActivity : AppCompatActivity() {
         onOpenConnections = ::showConnectionManager,
         onEnableNotifications = ::enableNotifications,
         onExportDiagnostics = ::showDiagnosticExport,
+        onLoadOlderHistory = ::loadOlderConversationHistory,
+        onOpenSubagentDirectory = { showSubagentDirectory = true; taskToolsController.refreshDescendants() },
         onShowDiagnostics = {
             val client = connectedServerUrl?.let(connectionClients::get)
             runtimeDialog = RuntimeDialogState("Connection diagnostics", client?.diagnosticsSummary() ?: "Disconnected", listOf(
@@ -1741,10 +1948,98 @@ class MainActivity : AppCompatActivity() {
         },
         onOpenModel = { composerController.toggleModelMenu(true) },
         onOpenPermissions = { composerController.togglePermissionMenu(true) },
-        onRetryLoading = { currentThreadId?.let(::openThread) }
+        onRetryLoading = { currentThreadId?.let(::openThread) },
+        subagents = app.codexremote.android.presentation.conversation.SubagentViewerController(onOpenAsTask = ::openThread) { childId, done ->
+            val ticket = navigationRequests.capture(connectedServerUrl, currentThreadId)
+            val server = connectedServerUrl
+            val credential = server?.let(tokenStore::load)
+            fun accepts() = navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId) &&
+                server == connectedServerUrl && credential == server?.let(tokenStore::load)
+            rpc("thread/read", JSONObject().put("threadId", childId).put("includeTurns", true), { error ->
+                if (accepts()) done(null, error)
+            }) { result ->
+                if (accepts()) done(result.optJSONObject("thread"), null)
+            }
+        }
     ) }
+    private fun featureRpc(method: String, params: JSONObject, done: (JSONObject?, String?) -> Unit) {
+        val server = connectedServerUrl ?: return done(null, "Not connected")
+        val device = tokenStore.loadCredential(server)?.deviceId
+        if (server !in connectedServerUrls) return done(null, "This host is offline")
+        val ticket = navigationRequests.capture(server, currentThreadId)
+        fun current() = navigationRequests.accepts(ticket, connectedServerUrl, currentThreadId) &&
+            tokenStore.loadCredential(server)?.deviceId == device
+        rpcOn(server, method, params, { if (current()) done(null, it) }) { if (current()) done(it, null) }
+    }
+
+    private val taskToolsController: TaskToolsController by lazy { TaskToolsController(
+        rpc = ::featureRpc,
+        onTaskSelected = ::openThread,
+        onTaskChanged = { requestThreads(); refreshCurrentThread() },
+        onTaskDeleted = { id ->
+            requestThreads()
+            if (id == currentThreadId) { val cwd = currentThread?.optString("cwd").orEmpty(); openDraft(cwd) }
+        },
+        onInspectDescendant = { id ->
+            val child = taskToolsController.uiState.value.descendants.tasks.firstOrNull { it.id == id }
+            conversationController.subagents.open(SubagentReference(id, child?.title ?: "Subagent", child?.status ?: "unknown"))
+        },
+    ) }
+    private val workspaceToolsController: WorkspaceToolsController by lazy { WorkspaceToolsController(::featureRpc) { path ->
+        val mention = "Use workspace file: $path"
+        composerController.updateText(listOf(composerDraft.takeIf { it.isNotBlank() }, mention).filterNotNull().joinToString("\n"))
+    } }
+
+    private fun hostFeatureRpc(server: String, method: String, params: JSONObject, done: (JSONObject?, String?) -> Unit) {
+        val device = tokenStore.loadCredential(server)?.deviceId
+        if (server !in connectedServerUrls) done(null, "This host is offline")
+        else rpcOn(server, method, params, { error ->
+            if (tokenStore.loadCredential(server)?.deviceId == device) done(null, error)
+        }) { result -> if (tokenStore.loadCredential(server)?.deviceId == device) done(result, null) }
+    }
+    private val workspaceMutationController: WorkspaceMutationController by lazy { WorkspaceMutationController(::hostFeatureRpc) }
+
+    private val hostToolsController: HostToolsController by lazy { HostToolsController(
+        rpc = ::hostFeatureRpc,
+        onOpenExternalUrl = { _, url ->
+            val uri = Uri.parse(url)
+            if (uri.scheme == "https" && !uri.host.isNullOrBlank() && uri.userInfo == null)
+                runCatching { startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, uri)) }
+                    .onFailure { toast("Could not open authorization link") }
+            else toast("The host returned an unsupported authorization link")
+        },
+    ) }
+    private val richResourcesController: RichResourcesController by lazy { RichResourcesController(::featureRpc) }
+
+    private val realtimeController: RealtimeController by lazy { RealtimeController(
+        rpc = ::featureRpc,
+        requestRecordPermission = { done ->
+            if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) done(true)
+            else if (pendingVoicePermission != null) done(false)
+            else { pendingVoicePermission = done; voicePermission.launch(android.Manifest.permission.RECORD_AUDIO) }
+        },
+        dispatch = { action -> main.post { action() } },
+    ) }
+
+    private fun syncFeatureScopes(thread: JSONObject) {
+        val server = connectedServerUrl ?: return
+        val device = tokenStore.loadCredential(server)?.deviceId.orEmpty()
+        val methods = if (server in connectedServerUrls) connectionClients[server]?.advertisedRpcMethods().orEmpty() else emptySet()
+        val id = thread.optString("id").takeIf { it.isNotBlank() && it != "null" }
+        hostToolsController.setScope(HostToolsScope(server, device, thread.optString("cwd"), id), methods)
+        workspaceMutationController.setScope(WorkspaceMutationScope(server, device, thread.optString("cwd"), id), methods)
+        richResourcesController.setScope(id?.let { RichResourceScope(server, device, it) }, methods)
+        realtimeController.setScope(id?.let { RealtimeScope(server, device, it) }, methods)
+        conversationController.setSubagentDiscoveryAvailable(id != null && "thread/list" in methods)
+        taskToolsController.setScope(id?.let { TaskToolsScope(server, device, it,
+            thread.optString("name").ifBlank { thread.optString("preview") }, thread.optBoolean("archived")) }, methods)
+        workspaceToolsController.setScope(thread.optString("cwd").takeIf { it.isNotBlank() && it != "null" }
+            ?.let { WorkspaceToolsScope(server, device, it) }, methods)
+    }
+
     private val composerController: ComposerController by lazy { ComposerController(
         onSend = { text, _, done -> composerDraft = text; persistComposer(); currentThread?.let(::performComposerSend); done(false) },
+        onSteer = { text, _, done -> composerDraft = text; persistComposer(); steerActiveTurn(text, done) },
         onStopTurn = ::interruptActiveTurn,
         onPickFiles = { pickAttachments(false) }, onPickPhotos = { pickAttachments(true) },
         onOpenSkillsCatalog = ::openCatalog,
@@ -1785,11 +2080,37 @@ class MainActivity : AppCompatActivity() {
     private data class PendingInteraction(val key: String, val server: String, val client: RemoteClient?, val message: JSONObject,
         var done: ((Boolean) -> Unit)? = null)
     private val pendingInteractions = linkedMapOf<String, PendingInteraction>()
+    private val clientToolRegistry = ClientToolRegistry()
+
+    private fun openFeatureLink(value: String): Boolean {
+        val uri = Uri.parse(value)
+        if (uri.scheme == "remote-file") {
+            richResourcesController.readFile(value)
+            return true
+        }
+        if (uri.scheme == "codex") {
+            val pullRequest = uri.getQueryParameter("pr")?.let(Uri::parse)
+            if (uri.host == "review" && pullRequest?.scheme == "https" && !pullRequest.host.isNullOrBlank() && pullRequest.userInfo == null) {
+                showInfo("Pull request review", "Open this pull request in the browser to view its hosted review.", listOf(
+                    RuntimeDialogAction("Open pull request") { runCatching { startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, pullRequest)) }.onFailure { toast("Could not open pull request") } },
+                    RuntimeDialogAction("Close") {},
+                ))
+            } else showInfo("Desktop link", "This link requires a desktop-only page that this host does not expose.")
+            return true
+        }
+        return false
+    }
 
     private fun mountCompose() {
         setContent {
             val editingServer = connectionsController.uiState.value.editingConnection?.serverUrl
             LaunchedEffect(editingServer) { editingServer?.let { refreshConnectionSettings(it) } }
+            val platformUriHandler = LocalUriHandler.current
+            CompositionLocalProvider(LocalUriHandler provides object : UriHandler {
+                override fun openUri(uri: String) {
+                    if (!openFeatureLink(uri)) platformUriHandler.openUri(uri)
+                }
+            }) {
             CodexApp(connectionsController, projectsController, sidebarController, conversationController,
                 composerController, catalogController, interactionsController, artifactsController, imageRepository,
                 addConnectionController = addConnectionController, onScanConnection = ::scanConnection,
@@ -1798,6 +2119,38 @@ class MainActivity : AppCompatActivity() {
                     content.bitmap?.let { artifactsController.openImageViewer(it, description, composerScope,
                         content.share != null, content.save != null, content.share, content.save) }
                 })
+            }
+            val referencedFile = richResourcesController.uiState.value.file
+            LaunchedEffect(referencedFile) {
+                referencedFile?.let { file ->
+                    val lines = file.text.lines()
+                    val target = file.startLine?.coerceIn(1, lines.size.coerceAtLeast(1))
+                    val excerpt = if (target == null) file.text else {
+                        val first = (target - 6).coerceAtLeast(0)
+                        val last = ((file.endLine ?: target) + 10).coerceAtMost(lines.size)
+                        lines.subList(first, last).mapIndexed { index, text -> "${first + index + 1}: $text" }.joinToString("\n")
+                    }
+                    showInfo(file.path + (target?.let { ":$it" } ?: ""), excerpt)
+                    richResourcesController.dismissContent()
+                }
+            }
+            val resourceError = richResourcesController.uiState.value.error
+            LaunchedEffect(resourceError) { if (resourceError != null) { showInfo("Resource unavailable", resourceError); richResourcesController.dismissContent() } }
+            if (showSubagentDirectory) {
+                val descendants = taskToolsController.uiState.value.descendants
+                app.codexremote.android.ui.theme.CodexTheme {
+                    app.codexremote.android.ui.conversation.SubagentDirectoryDialog(
+                        entries = descendants.tasks.map { SubagentDirectoryEntry(it.id, it.title, it.status, it.parentThreadId, it.canAcceptDirectInput, it.agentRole) },
+                        loading = descendants.loading || descendants.loadingMore,
+                        error = descendants.error,
+                        canLoadMore = descendants.nextCursor != null,
+                        onRefresh = taskToolsController::refreshDescendants,
+                        onLoadMore = taskToolsController::loadMoreDescendants,
+                        onInspect = { id -> showSubagentDirectory = false; taskToolsController.selectDescendant(id) },
+                        onDismiss = { showSubagentDirectory = false },
+                    )
+                }
+            }
             RuntimeDialog(runtimeDialog) { runtimeDialog = null }
             diagnosticReport?.let { report ->
                 app.codexremote.android.ui.theme.CodexTheme {
@@ -1987,7 +2340,14 @@ class MainActivity : AppCompatActivity() {
             })
         } else pendingSidebarState?.let { outState.putBundle("remoteSidebar", it) }
     }
+    override fun onPause() {
+        if (pendingVoicePermission == null) realtimeController.onPause()
+        super.onPause()
+    }
     override fun onDestroy() {
+        pendingVoicePermission?.invoke(false)
+        pendingVoicePermission = null
+        realtimeController.setScope(null, emptySet())
         persistComposer(); main.removeCallbacksAndMessages(null)
         connectionClients.values.forEach(RemoteClient::close); utilityClient.close(); super.onDestroy()
     }
@@ -2067,6 +2427,7 @@ class MainActivity : AppCompatActivity() {
         } }
     }
     private fun showConversation(thread: JSONObject) {
+        syncFeatureScopes(thread)
         val conversationKey = thread.optString("id").ifBlank { "draft:${thread.optString("cwd")}" }
         val server = connectedServerUrl
         val device = server?.let { tokenStore.loadCredential(it)?.deviceId }.orEmpty()
@@ -2146,7 +2507,11 @@ class MainActivity : AppCompatActivity() {
         conversationController.setTimelineItems(delivered.items, turnRunning, delivered.statuses)
     }
     private fun appendLiveAssistantDelta(delta: String) { liveAssistantText += delta; scheduleLiveTimelineRender() }
-    private fun updateComposerPrimaryButton() { syncAttachments(); composerController.setTurnRunning(turnRunning) }
+    private fun updateComposerPrimaryButton() {
+        syncAttachments()
+        composerController.setTurnRunning(turnRunning)
+        composerController.setSteeringAvailable(connectedServerUrl?.let { connectionClients[it]?.supportsRpcMethod("turn/steer") } == true)
+    }
     private fun updateComposerActionBarState() = updateComposerPrimaryButton()
     private fun updateComposerLabels() {
         val model = models.firstOrNull { it.model == selectedModel }
@@ -2482,6 +2847,19 @@ class MainActivity : AppCompatActivity() {
         if (approvalState != null || interactionsController.uiState.value != null) return
         val request = pendingInteractions.values.firstOrNull() ?: return
         val method = request.message.optString("method"); val params = request.message.optJSONObject("params") ?: JSONObject()
+        if (method == "item/tool/call") {
+            val client = request.client
+            if (client == null || connectionClients[request.server] !== client) return
+            runCatching {
+                when (val result = clientToolRegistry.dispatch(params)) {
+                    is ClientToolRegistry.DispatchResult.Handled -> client.answer(request.message.optString("requestId"), result.response)
+                    is ClientToolRegistry.DispatchResult.Unsupported -> client.answerError(request.message.optString("requestId"), result.message)
+                }
+            }.onFailure { client.answerError(request.message.optString("requestId"), "Client tool could not complete") }
+            pendingInteractions.remove(request.key)
+            presentNextInteraction()
+            return
+        }
         if (method in setOf("item/tool/requestUserInput", "mcpServer/elicitation/request")) {
             val saved = pendingInteractionDrafts.remove(request.key) as? JSONObject
             val draft = saved?.takeIf { it.optString("device").isNotBlank() && it.optString("device") == tokenStore.loadCredential(request.server)?.deviceId }?.optJSONObject("draft")
@@ -2495,15 +2873,10 @@ class MainActivity : AppCompatActivity() {
             runCatching { request.client?.answerError(request.message.optString("requestId"), "Unsupported interactive request; handle it on the host") }
             pendingInteractions.remove(request.key); toast("Host action required for $method"); presentNextInteraction(); return
         }
-        val choices = approvalChoices(method, params)
-        val detail = ApprovalDetails.format(method, params) + if (!choices.allow) "\n\nReview this request on the host, or deny it here." else ""
+        val model = ApprovalDecisionModel.from(method, params)
+        val detail = ApprovalDetails.format(method, params) + "\n\n" + model.choices.joinToString("\n") { "${it.label}: ${it.consequence}" }
         approvalState = ApprovalUiState(request.key, when { method.contains("permissions") -> "Allow additional permissions?"; method.contains("commandExecution") -> "Allow command?"; else -> "Allow file changes?" }, detail,
-            buildList { if (choices.allow) add(ApprovalUiChoice("allow", "Allow")); add(ApprovalUiChoice("deny", choices.negativeLabel)) })
-    }
-    private fun approvalChoices(method: String, params: JSONObject): ApprovalChoices = when {
-        method == "item/commandExecution/requestApproval" -> ApprovalChoices.from(params)
-        method == "item/fileChange/requestApproval" && (params.optJSONObject("fileChangeReview")?.optString("status") != "available" || !params.isNull("grantRoot") && params.optString("grantRoot").isNotBlank()) -> ApprovalChoices(false, "decline")
-        else -> ApprovalChoices(true, "decline")
+            model.choices.map { ApprovalUiChoice(it.id, it.label) }.ifEmpty { listOf(ApprovalUiChoice("unsupported-cancel", "Cancel request")) })
     }
     private fun answerInteraction(key: String, result: JSONObject, cancel: Boolean, done: (Boolean) -> Unit) {
         val request = pendingInteractions[key] ?: return done(false)
@@ -2526,14 +2899,12 @@ class MainActivity : AppCompatActivity() {
         val client = request.client ?: return
         if (connectionClients[request.server] !== client) return
         val method = request.message.optString("method"); val params = request.message.optJSONObject("params") ?: JSONObject()
-        val choices = approvalChoices(method, params); val allow = choice == "allow"
-        if (allow && !choices.allow) return
-        val permissions = method == "item/permissions/requestApproval"
-        val result = if (permissions) JSONObject().put("permissions", if (allow) params.optJSONObject("permissions") ?: JSONObject() else JSONObject()).put("scope", "turn")
-            else JSONObject().put("decision", if (allow) "accept" else choices.negativeDecision)
+        val model = ApprovalDecisionModel.from(method, params)
+        val result = if (choice in setOf("unsupported-cancel", "cancel") && model.choices.none { it.id == choice }) null
+            else runCatching { model.result(choice) }.getOrNull() ?: return
         approvalState = state.copy(isBusy = true, error = null)
         runCatching {
-            if (choice == "cancel" || !permissions && !allow && choices.negativeDecision == null) client.answerError(request.message.optString("requestId"), "Unsupported approval decisions; user cancelled the request")
+            if (result == null) client.answerError(request.message.optString("requestId"), "Unsupported approval request cancelled by user")
             else client.answer(request.message.optString("requestId"), result)
         }.onFailure { approvalState = state.copy(error = "Reply queued until the host reconnects") }
         if (!client.supportsInteractionAcknowledgements()) finishInteraction(state.key, true)

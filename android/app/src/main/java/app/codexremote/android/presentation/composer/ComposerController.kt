@@ -8,6 +8,7 @@ import app.codexremote.android.compose.AttachmentItemUiState
 
 class ComposerController(
     private val onSend: (String, List<AttachmentItemUiState>, onDispatched: (Boolean) -> Unit) -> Unit = { _, _, _ -> },
+    private val onSteer: (String, List<AttachmentItemUiState>, onDispatched: (Boolean) -> Unit) -> Unit = { _, _, done -> done(false) },
     private val onStopTurn: () -> Unit = {},
     private val onPickFiles: () -> Unit = {},
     private val onPickPhotos: () -> Unit = {},
@@ -23,6 +24,7 @@ class ComposerController(
 ) {
     private val _uiState = mutableStateOf(ComposerUiState())
     val uiState: State<ComposerUiState> = _uiState
+    private var steeringGeneration = 0L
 
     fun updateTextFieldValue(value: TextFieldValue) {
         _uiState.value = _uiState.value.copy(
@@ -61,6 +63,29 @@ class ComposerController(
 
     fun setTurnRunning(running: Boolean) {
         _uiState.value = _uiState.value.copy(isTurnRunning = running)
+    }
+
+    fun setSteeringAvailable(available: Boolean) {
+        _uiState.value = _uiState.value.copy(canSteer = available)
+    }
+
+    fun stopTurn() = onStopTurn()
+
+    /** Keep Stop separate: a failed update must never interrupt a running task. */
+    fun steer() {
+        val submitted = _uiState.value
+        if (!submitted.isTurnRunning || !submitted.canSteer || submitted.isSteering ||
+            submitted.isAwaitingAttachments || (submitted.text.isBlank() && submitted.attachments.isEmpty())) return
+        _uiState.value = submitted.copy(isSteering = true)
+        val generation = ++steeringGeneration
+        onSteer(submitted.text, submitted.attachments) { accepted ->
+            if (generation != steeringGeneration || _uiState.value.draftIdentity != submitted.draftIdentity) return@onSteer
+            _uiState.value = _uiState.value.copy(isSteering = false)
+            if (accepted && _uiState.value.text == submitted.text && _uiState.value.attachments == submitted.attachments) {
+                clearDraft()
+                onTextChanged(TextFieldValue())
+            }
+        }
     }
 
     fun setExpanded(expanded: Boolean) {
@@ -102,7 +127,8 @@ class ComposerController(
 
     fun setDraftIdentity(identity: String?) {
         if (_uiState.value.draftIdentity == identity) return
-        _uiState.value = _uiState.value.copy(draftIdentity = identity,
+        steeringGeneration++
+        _uiState.value = _uiState.value.copy(draftIdentity = identity, isSteering = false,
             showAddMenu = false, showModelMenu = false, showPermissionMenu = false,
             pendingPermissionId = null, showFullAccessWarning = false)
     }

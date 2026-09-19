@@ -15,6 +15,7 @@ class LiveTimelineStore {
         val startedAtEpochMs: Long,
         val items: LinkedHashMap<String, TimelineItem> = linkedMapOf(),
         val completedItems: MutableSet<String> = mutableSetOf(),
+        var turnDiff: TurnDiffSummary? = null,
     )
 
     private val threads = object : LinkedHashMap<String, LinkedHashMap<String, TurnBuffer>>(8, 0.75f, true) {
@@ -24,12 +25,25 @@ class LiveTimelineStore {
     }
     private val cancellationRequests = mutableSetOf<Pair<String, String>>()
 
-    fun record(method: String, params: JSONObject): Boolean {
-        val threadId = params.optString("threadId")
+    fun record(method: String, params: JSONObject, scopedThreadId: String? = null): Boolean {
+        val threadId = params.optString("threadId").takeUnless { it == "null" }.orEmpty()
+            .ifBlank { scopedThreadId.orEmpty() }
         if (threadId.isBlank()) return false
         val turnObject = params.optJSONObject("turn")
-        val turnId = params.optString("turnId").ifBlank { turnObject?.optString("id").orEmpty() }
-        if (turnId.isBlank()) return false
+        val explicitTurnId = params.optString("turnId").takeUnless { it == "null" }.orEmpty()
+            .ifBlank { turnObject?.optString("id")?.takeUnless { it == "null" }.orEmpty() }
+        val allowsMissingTurn = method in setOf(
+            "warning",
+            "guardianWarning",
+            "configWarning",
+            "thread/settings/updated",
+            "hook/started",
+            "hook/completed",
+        )
+        if (explicitTurnId.isBlank() && !allowsMissingTurn) return false
+        val turnId = explicitTurnId.ifBlank {
+            activeTurnId(threadId).orEmpty().ifBlank { threadNoticeTurnId(threadId) }
+        }
 
         return when (method) {
             "turn/started" -> {
@@ -98,12 +112,55 @@ class LiveTimelineStore {
                 params.optString("itemId"),
                 params.optJSONArray("changes"),
             )
+            "turn/plan/updated" -> updatePlan(threadId, turnId, params)
+            "model/rerouted" -> upsertNotice(
+                threadId,
+                turnId,
+                TimelineItem(
+                    id = "model-rerouted-$turnId",
+                    label = "Model rerouted",
+                    text = buildString {
+                        append(params.optString("fromModel")).append(" → ").append(params.optString("toModel"))
+                        params.optString("reason").takeIf(String::isNotBlank)?.let { append("\nReason: ").append(humanize(it)) }
+                    },
+                    kind = TimelineItem.Kind.TOOL,
+                    phase = "completed",
+                ),
+            )
+            "warning", "guardianWarning", "configWarning" -> recordWarning(threadId, turnId, method, params)
+            "thread/settings/updated" -> upsertNotice(
+                threadId,
+                turnId,
+                TimelineItem(
+                    id = "thread-settings-$turnId",
+                    label = "Task settings updated",
+                    text = params.optJSONObject("threadSettings")?.toString(2).orEmpty(),
+                    kind = TimelineItem.Kind.TOOL,
+                    phase = "completed",
+                ),
+            )
+            "item/autoApprovalReview/started", "item/autoApprovalReview/completed" ->
+                updateApprovalReview(threadId, turnId, params, method.endsWith("/completed"))
+            "hook/started", "hook/completed" -> updateHook(threadId, turnId, params, method.endsWith("/completed"))
+            "item/mcpToolCall/progress" -> appendMcpProgress(
+                threadId,
+                turnId,
+                params.optString("itemId"),
+                params.optString("message"),
+            )
+            "turn/diff/updated" -> {
+                val summary = ThreadProjection.turnDiffSummary(params.optString("diff")) ?: return false
+                turn(threadId, turnId).turnDiff = summary
+                true
+            }
             else -> false
         }
     }
 
     fun snapshots(threadId: String): Map<String, LiveTurnSnapshot> = threads[threadId]
-        ?.mapValues { (_, turn) -> LiveTurnSnapshot(turn.status, turn.items.values.toList(), turn.startedAtEpochMs) }
+        ?.mapValues { (_, turn) ->
+            LiveTurnSnapshot(turn.status, turn.items.values.toList(), turn.startedAtEpochMs, turn.turnDiff)
+        }
         .orEmpty()
 
     fun activeTurnId(threadId: String): String? = threads[threadId]
@@ -183,6 +240,220 @@ class LiveTimelineStore {
         return true
     }
 
+    private fun updatePlan(threadId: String, turnId: String, params: JSONObject): Boolean {
+        val steps = buildList {
+            val array = params.optJSONArray("plan")
+            if (array != null) for (index in 0 until array.length()) {
+                val step = array.optJSONObject(index) ?: continue
+                val text = step.optString("step")
+                if (text.isNotBlank()) add(PlanStep(text, step.optString("status").ifBlank { "pending" }))
+            }
+        }
+        val explanation = params.optString("explanation").takeUnless { it == "null" }.orEmpty()
+        val text = buildList {
+            explanation.takeIf(String::isNotBlank)?.let(::add)
+            steps.forEach { step ->
+                val marker = when (step.status.lowercase().replace("_", "")) {
+                    "completed" -> "✓"
+                    "inprogress" -> "→"
+                    else -> "○"
+                }
+                add("$marker ${step.text}")
+            }
+        }.joinToString("\n")
+        val active = steps.any { it.status.lowercase().replace("_", "") == "inprogress" }
+        return upsertNotice(
+            threadId,
+            turnId,
+            TimelineItem(
+                id = "turn-plan-$turnId",
+                label = if (active) "Plan in progress" else "Plan updated",
+                text = text,
+                kind = TimelineItem.Kind.PLAN,
+                phase = if (active) "inprogress" else "completed",
+                active = active,
+                stepCurrent = steps.count { it.status.equals("completed", ignoreCase = true) },
+                stepTotal = steps.size,
+                planSteps = steps,
+            ),
+        )
+    }
+
+    private fun recordWarning(
+        threadId: String,
+        turnId: String,
+        method: String,
+        params: JSONObject,
+    ): Boolean {
+        val label = when (method) {
+            "guardianWarning" -> "Guardian warning"
+            "configWarning" -> "Configuration warning"
+            else -> "Warning"
+        }
+        val summary = params.optString("message").ifBlank { params.optString("summary") }
+        val text = buildList {
+            summary.takeIf(String::isNotBlank)?.let(::add)
+            params.optString("details").takeUnless { it == "null" }?.takeIf(String::isNotBlank)?.let(::add)
+            params.optString("path").takeIf(String::isNotBlank)?.let { add("Config: $it") }
+        }.joinToString("\n")
+        val identity = listOf(method, summary, params.optString("path")).joinToString("|").hashCode()
+        return upsertNotice(
+            threadId,
+            turnId,
+            TimelineItem("notice-$identity", label, text, TimelineItem.Kind.ERROR, phase = "warning"),
+        )
+    }
+
+    private fun updateApprovalReview(
+        threadId: String,
+        turnId: String,
+        params: JSONObject,
+        completed: Boolean,
+    ): Boolean {
+        val reviewId = params.optString("reviewId")
+        if (reviewId.isBlank()) return false
+        val review = params.optJSONObject("review") ?: JSONObject()
+        val action = params.optJSONObject("action") ?: JSONObject()
+        val actionType = action.optString("type").ifBlank { "action" }
+        val actionSummary = approvalActionSummary(action)
+        val details = ApprovalReviewDetails(
+            reviewId = reviewId,
+            targetItemId = params.optString("targetItemId").takeUnless { it.isBlank() || it == "null" },
+            status = review.optString("status").ifBlank { if (completed) "completed" else "inProgress" },
+            riskLevel = review.optString("riskLevel").takeUnless { it.isBlank() || it == "null" },
+            userAuthorization = review.optString("userAuthorization").takeUnless { it.isBlank() || it == "null" },
+            rationale = review.optString("rationale").takeUnless { it.isBlank() || it == "null" },
+            actionType = actionType,
+            actionSummary = actionSummary,
+            decisionSource = params.optString("decisionSource").takeUnless { it.isBlank() || it == "null" },
+            startedAtEpochMs = (params.opt("startedAtMs") as? Number)?.toLong(),
+            completedAtEpochMs = (params.opt("completedAtMs") as? Number)?.toLong(),
+        )
+        val text = buildList {
+            actionSummary.takeIf(String::isNotBlank)?.let(::add)
+            details.rationale?.let(::add)
+            details.riskLevel?.let { add("Risk: $it") }
+            details.userAuthorization?.let { add("User authorization: $it") }
+        }.joinToString("\n")
+        return upsertNotice(
+            threadId,
+            turnId,
+            TimelineItem(
+                id = "auto-review-$reviewId",
+                label = if (completed) "Auto-approval review: ${humanize(details.status)}" else "Reviewing approval",
+                text = text,
+                kind = TimelineItem.Kind.TOOL,
+                phase = details.status,
+                active = !completed,
+                startedAtEpochMs = details.startedAtEpochMs,
+                durationMs = if (details.startedAtEpochMs != null && details.completedAtEpochMs != null) {
+                    (details.completedAtEpochMs - details.startedAtEpochMs).coerceAtLeast(0L)
+                } else null,
+                approvalReview = details,
+            ),
+        )
+    }
+
+    private fun approvalActionSummary(action: JSONObject): String = when (action.optString("type")) {
+        "command" -> action.optString("command")
+        "execve" -> buildList {
+            action.optString("program").takeIf(String::isNotBlank)?.let(::add)
+            val argv = action.optJSONArray("argv")
+            if (argv != null) for (index in 0 until argv.length()) argv.optString(index).takeIf(String::isNotBlank)?.let(::add)
+        }.joinToString(" ")
+        "applyPatch" -> "Apply changes to ${action.optJSONArray("files")?.length() ?: 0} file(s)"
+        "networkAccess" -> buildString {
+            append(action.optString("protocol").ifBlank { "network" }).append(" ")
+            append(action.optString("host").ifBlank { action.optString("target") })
+            val port = action.optInt("port", -1)
+            if (port >= 0) append(":").append(port)
+        }.trim()
+        "mcpToolCall" -> listOf(action.optString("connectorName"), action.optString("server"), action.optString("toolTitle"), action.optString("toolName"))
+            .firstOrNull(String::isNotBlank).orEmpty()
+        "requestPermissions" -> action.optString("reason").takeUnless { it == "null" }.orEmpty()
+        else -> ""
+    }
+
+    private fun updateHook(
+        threadId: String,
+        turnId: String,
+        params: JSONObject,
+        completed: Boolean,
+    ): Boolean {
+        val run = params.optJSONObject("run") ?: return false
+        val id = run.optString("id")
+        if (id.isBlank()) return false
+        val status = run.optString("status").ifBlank { if (completed) "completed" else "running" }
+        val entries = buildList {
+            val values = run.optJSONArray("entries")
+            if (values != null) for (index in 0 until values.length()) {
+                val entry = values.optJSONObject(index) ?: continue
+                val value = entry.optString("text")
+                if (value.isNotBlank()) add("${humanize(entry.optString("kind"))}: $value")
+            }
+        }
+        val text = buildList {
+            run.optString("statusMessage").takeUnless { it == "null" }?.takeIf(String::isNotBlank)?.let(::add)
+            addAll(entries)
+        }.joinToString("\n")
+        return upsertNotice(
+            threadId,
+            turnId,
+            TimelineItem(
+                id = "hook-$id",
+                label = "${humanize(run.optString("eventName"))} hook",
+                text = text,
+                kind = TimelineItem.Kind.TOOL,
+                phase = status,
+                active = !completed && status.equals("running", ignoreCase = true),
+                startedAtEpochMs = (run.opt("startedAt") as? Number)?.toLong(),
+                durationMs = (run.opt("durationMs") as? Number)?.toLong(),
+            ),
+        )
+    }
+
+    private fun appendMcpProgress(
+        threadId: String,
+        turnId: String,
+        itemId: String,
+        message: String,
+    ): Boolean {
+        if (itemId.isBlank() || message.isBlank()) return false
+        val buffer = turn(threadId, turnId)
+        if (itemId in buffer.completedItems || !buffer.status.equals("inProgress", ignoreCase = true)) return false
+        val current = buffer.items[itemId]
+        val previousText = current?.text.orEmpty()
+        val text = if (previousText.lineSequence().lastOrNull() == message) previousText else {
+            listOf(previousText, message).filter(String::isNotBlank).joinToString("\n").takeLast(MAX_ITEM_TEXT)
+        }
+        buffer.items[itemId] = (current ?: TimelineItem(
+            id = itemId,
+            label = "Using integration",
+            text = "",
+            kind = TimelineItem.Kind.TOOL,
+            toolStyle = TimelineItem.ToolStyle.INTEGRATION,
+        )).copy(text = text, active = true, phase = "inprogress")
+        trimItems(buffer)
+        return true
+    }
+
+    private fun upsertNotice(threadId: String, turnId: String, item: TimelineItem): Boolean {
+        val buffer = turn(threadId, turnId)
+        if (turnId == threadNoticeTurnId(threadId)) buffer.status = "completed"
+        buffer.items[item.id] = item
+        if (!item.active) buffer.completedItems += item.id
+        trimItems(buffer)
+        return true
+    }
+
+    private fun threadNoticeTurnId(threadId: String) = "thread-notices-$threadId"
+
+    private fun humanize(value: String): String = value
+        .replace(Regex("([a-z])([A-Z])"), "$1 $2")
+        .replace('_', ' ')
+        .trim()
+        .replaceFirstChar { it.uppercase() }
+
     private fun recordTurnItems(threadId: String, turnId: String, turnObject: JSONObject?, completed: Boolean): Boolean {
         val items = turnObject?.optJSONArray("items") ?: return false
         var changed = false
@@ -220,6 +491,9 @@ class LiveTimelineStore {
             filesChanged = mergedPaths.size,
             additions = if (projectedHasDiff || previous == null) projected.additions else previous.additions,
             deletions = if (projectedHasDiff || previous == null) projected.deletions else previous.deletions,
+            planSteps = projected.planSteps.ifEmpty { previous?.planSteps.orEmpty() },
+            richOutputReferences = (previous?.richOutputReferences.orEmpty() + projected.richOutputReferences).distinct(),
+            approvalReview = projected.approvalReview ?: previous?.approvalReview,
         )
         buffer.items[projected.id] = finalItem
         trimItems(buffer)

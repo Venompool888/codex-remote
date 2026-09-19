@@ -28,6 +28,8 @@ data class ComposerUiState(
     val textFieldValue: TextFieldValue = TextFieldValue(),
     val attachments: List<AttachmentItemUiState> = emptyList(),
     val isTurnRunning: Boolean = false,
+    val canSteer: Boolean = false,
+    val isSteering: Boolean = false,
     val isAwaitingAttachments: Boolean = false,
     val isExpanded: Boolean = false,
     val modelOptions: List<ComposerOption> = emptyList(),

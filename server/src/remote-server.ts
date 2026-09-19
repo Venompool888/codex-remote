@@ -4,7 +4,7 @@ import { fileChangeReview } from "./file-change-review.js";
 import { StreamingSecrets } from "./streaming-secrets.js";
 import { RequestBudget } from "./request-budget.js";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { WebSocketServer, WebSocket } from "ws";
 import type { AddressInfo } from "node:net";
@@ -33,6 +33,16 @@ import { CapabilityCatalog } from "./capability-catalog.js";
 import { AttachmentStore, AttachmentSizeError } from "./attachment-store.js";
 import { OrderedDelivery } from './ordered-delivery.js';
 import { CUSTOM_CONFIG_PERMISSION, resolvePermissionSelection } from './permission-selection.js';
+import {
+  projectFileSearch,
+  projectGitDiff,
+  readWorkspaceText,
+  validateFeatureParams,
+  validatedWorkspace,
+} from "./workspace-features.js";
+import { HostManagement, HOST_MANAGEMENT_METHODS } from "./host-management.js";
+import { RichResourceBridge } from "./rich-resource.js";
+import { WorkspaceMutations, WORKSPACE_MUTATION_METHODS } from "./workspace-mutations.js";
 
 interface RemoteHostOptions {
   host: string;
@@ -73,6 +83,7 @@ interface RpcOutcome {
 
 interface IdempotencyEntry {
   expiresAt: number;
+  fingerprint: string;
   promise: Promise<RpcOutcome>;
 }
 
@@ -117,6 +128,9 @@ export class RemoteHost {
   }>();
 
   private readonly catalog: CapabilityCatalog;
+  private readonly management: HostManagement;
+  private readonly richResources: RichResourceBridge;
+  private readonly workspaceMutations: WorkspaceMutations;
 
   private capabilities() {
     const capabilities = currentRemoteCapabilities({
@@ -131,6 +145,9 @@ export class RemoteHost {
 
   constructor(private readonly options: RemoteHostOptions) {
     this.catalog = new CapabilityCatalog(options.codex);
+    this.management = new HostManagement(options.codex);
+    this.richResources = new RichResourceBridge(options.codex);
+    this.workspaceMutations = new WorkspaceMutations(options.codex);
     this.server.on("upgrade", (request, socket, head) => {
       void this.handleUpgrade(request, socket, head).catch(() => socket.destroy());
     });
@@ -275,7 +292,7 @@ export class RemoteHost {
         credential: { expiresAt: rotated.device.expiresAt, scopes: rotated.device.scopes },
         token: rotated.token,
       });
-      queueMicrotask(() => this.closeDeviceSockets(rotated.device.id, "Device credential rotated"));
+      queueMicrotask(() => void this.closeDeviceSockets(rotated.device.id, "Device credential rotated"));
       return;
     }
     if (url.pathname === "/v2/device" && request.method === "DELETE") {
@@ -284,7 +301,7 @@ export class RemoteHost {
       if (!current) return json(response, 401, { error: "Device credential is invalid or expired" });
       if (!current.scopes.includes("device:revoke")) return json(response, 403, { error: "Device cannot revoke credentials" });
       await this.options.auth.revoke(current.id);
-      this.closeDeviceSockets(current.id, "Device credential revoked");
+      await this.closeDeviceSockets(current.id, "Device credential revoked");
       let referenceCleanup = true;
       try { await this.options.routingReferences?.revokeDevice(current.id); }
       catch { referenceCleanup = false; console.error('Revoked device routing cleanup requires host repair'); }
@@ -580,6 +597,10 @@ export class RemoteHost {
       try { params = await wire.routing.inbound(params, message.method === 'host/workspace/validate') as Record<string, unknown>; }
       catch { send(socket, {type:'rpc_error',id:message.id,error:'Workspace reference unavailable; refresh the task or project'}); return; }
     }
+    try { validateFeatureParams(message.method, params); }
+    catch (error) { send(socket, { type: "rpc_error", id: message.id, error: messageOf(error) }); return; }
+    try { params = validateRealtimeParams(message.method, params); }
+    catch (error) { send(socket, { type: "rpc_error", id: message.id, error: messageOf(error) }); return; }
     if (message.method === "host/artifacts/list") {
       if (!this.options.artifacts) { send(socket, { type: "rpc_error", id: message.id, error: "Artifact download is not configured" }); return; }
       try {
@@ -605,6 +626,62 @@ export class RemoteHost {
       } catch (error) {
         send(socket, { type: "rpc_error", id: message.id, error: messageOf(error) });
       }
+      return;
+    }
+    if (message.method === "host/account/usage") {
+      const [limits, usage] = await Promise.allSettled([
+        this.options.codex.call("account/rateLimits/read", {}),
+        this.options.codex.call("account/usage/read", {}),
+      ]);
+      send(socket, { type: "rpc_result", id: message.id, result: projectAccountUsage(limits, usage) });
+      return;
+    }
+    if (message.method === "host/administration/status") {
+      send(socket, { type: "rpc_result", id: message.id, result: {
+        auth: { status: "browser_or_device_flow", apiKeysAccepted: false },
+        mcp: { status: "oauth_and_reload" },
+        plugins: { status: "catalog_install_uninstall", localPathsAccepted: false },
+        config: { status: "named_settings_only", settings: ["web_search", "model_verbosity", "model_reasoning_summary"] },
+        terminal: { status: "device_scoped", arbitraryEnvironmentAccepted: false },
+      } });
+      return;
+    }
+    if (message.method === "host/workspace/files/search") {
+      try {
+        const cwd = await validatedWorkspace(params.cwd);
+        if (typeof params.query !== "string" || !params.query.trim() || params.query.length > 500) throw new Error("Search text must contain 1-500 characters");
+        const result = await this.options.codex.call("fuzzyFileSearch", { query: params.query, roots: [cwd], cancellationToken: null });
+        send(socket, { type: "rpc_result", id: message.id, result: projectFileSearch(result, cwd) });
+      } catch (error) { send(socket, { type: "rpc_error", id: message.id, error: featureError("Workspace file search", error) }); }
+      return;
+    }
+    if (message.method === "host/workspace/file/read") {
+      try { send(socket, { type: "rpc_result", id: message.id, result: await readWorkspaceText(params.cwd, params.path) }); }
+      catch (error) { send(socket, { type: "rpc_error", id: message.id, error: messageOf(error) }); }
+      return;
+    }
+    if (message.method === "host/file/readReference") {
+      try {
+        assertExactKeys(params, ["threadId", "reference"], "File reference read");
+        send(socket, { type: "rpc_result", id: message.id, result: await this.richResources.readFileReference(params.threadId, params.reference) });
+      }
+      catch (error) { send(socket, { type: "rpc_error", id: message.id, error: messageOf(error) }); }
+      return;
+    }
+    if (message.method === "host/mcp/resource/read") {
+      try {
+        assertExactKeys(params, ["threadId", "server", "uri"], "MCP resource read");
+        send(socket, { type: "rpc_result", id: message.id, result: this.sanitizePayload(await this.richResources.readMcpResource(params)) });
+      }
+      catch (error) { send(socket, { type: "rpc_error", id: message.id, error: featureError("MCP resource reading", error) }); }
+      return;
+    }
+    if (message.method === "host/git/diff") {
+      try {
+        const cwd = await validatedWorkspace(params.cwd);
+        const result = await this.options.codex.call("gitDiffToRemote", { cwd });
+        send(socket, { type: "rpc_result", id: message.id, result: projectGitDiff(result) });
+      } catch (error) { send(socket, { type: "rpc_error", id: message.id, error: featureError("Git diff", error) }); }
       return;
     }
     if (message.method === "host/apps/installed") {
@@ -672,12 +749,25 @@ export class RemoteHost {
       params.cwd = this.options.defaultCwd;
     }
     const isWrite = requiredScope === "rpc:write";
+    const requiresV2Write = HOST_MANAGEMENT_METHODS.has(message.method)
+      || WORKSPACE_MUTATION_METHODS.has(message.method)
+      || (message.method.startsWith("thread/realtime/") && message.method !== "thread/realtime/listVoices");
+    if (requiresV2Write && isWrite && state.protocolVersion < 2) {
+      send(socket, { type: "rpc_error", id: message.id, error: "This write operation requires Remote protocol v2" });
+      return;
+    }
     if (state.protocolVersion >= 2 && isWrite && !message.idempotencyKey) {
       send(socket, { type: "rpc_error", id: message.id, error: "A v2 write RPC requires idempotencyKey" });
       return;
     }
     const execute = async (): Promise<RpcOutcome> => {
       try {
+        if (HOST_MANAGEMENT_METHODS.has(message.method)) {
+          return { ok: true, result: this.sanitizePayload(await this.management.call(message.method, params, state.deviceId)) };
+        }
+        if (WORKSPACE_MUTATION_METHODS.has(message.method)) {
+          return { ok: true, result: this.sanitizePayload(await this.workspaceMutations.call(message.method, params)) };
+        }
         if (message.method === "thread/start" || message.method === "turn/start") {
           params = await resolvePermissionSelection(message.method, params, this.options.codex);
         }
@@ -716,7 +806,8 @@ export class RemoteHost {
           data.push({ id: CUSTOM_CONFIG_PERMISSION, description: "Codex uses the permission defined in config.toml", allowed: true });
           result = { ...result, data };
         }
-        if (message.method === "thread/read") result = await hydrateThreadHistory(result);
+        if (message.method === "thread/read" && params.includeTurns !== false) result = await hydrateThreadHistory(result);
+        if (message.method === "thread/turns/list") result = await hydrateTurnsPage(this.options.codex, params, result);
         return { ok: true, result: this.sanitizePayload(result) };
       } catch (error) {
         return { ok: false, error: String(publicPayload(messageOf(error), "error")) };
@@ -726,9 +817,15 @@ export class RemoteHost {
     if (state.protocolVersion >= 2 && isWrite && message.idempotencyKey) {
       this.cleanupIdempotency();
       const key = `${state.deviceId}\u0000${message.method}\u0000${message.idempotencyKey}`;
+      const fingerprint = requestFingerprint(params);
       let entry = this.idempotency.get(key);
+      if (entry && entry.fingerprint !== fingerprint) {
+        send(socket, { type: "rpc_error", id: message.id, error: "Idempotency key was already used with different parameters" });
+        return;
+      }
       if (!entry) {
-        entry = { expiresAt: Date.now() + 24 * 60 * 60_000, promise: this.options.ledger ? this.options.ledger.run(key, execute) : execute() };
+        entry = { expiresAt: Date.now() + 24 * 60 * 60_000, fingerprint,
+          promise: this.options.ledger ? this.options.ledger.run(key, params, execute) : execute() };
         this.idempotency.set(key, entry);
       }
       try { outcome = await entry.promise; } catch { outcome = { ok: false, error: "Could not confirm this operation safely; inspect the task before retrying" }; }
@@ -797,6 +894,20 @@ export class RemoteHost {
   }
 
   private broadcastEvent(method: string, params: unknown): void {
+    const routed = this.management.routeNotification(method, params);
+    if (routed === null) return;
+    if (routed) {
+      const sequence = ++this.sequence;
+      const event = this.sanitizePayload({ type: "codex_event", sequence, method, params: routed.params }) as object;
+      const placeholder = { type: "codex_event", sequence, method: routed.placeholderMethod ?? "host/terminal/activity", params: { replayable: false } };
+      this.eventJournal.push(placeholder);
+      if (this.eventJournal.length > 500) this.eventJournal.shift();
+      for (const [socket, state] of this.socketStates) {
+        if (!state.negotiated) continue;
+        send(socket, state.deviceId === routed.deviceId ? event : placeholder);
+      }
+      return;
+    }
     if (isObject(params)) {
       const thread = typeof params.threadId === "string" ? params.threadId : "";
       const item = typeof params.itemId === "string" ? params.itemId :
@@ -853,30 +964,51 @@ export class RemoteHost {
   }
 
   private sanitizePayload(value: unknown): unknown {
-    return publicPayload(this.options.attachments?.redactOutbound(value) ?? value, "", Boolean(this.options.artifacts));
+    const projected = this.richResources.project(value);
+    return publicPayload(this.options.attachments?.redactOutbound(projected) ?? projected, "", Boolean(this.options.artifacts));
   }
 
-  private closeDeviceSockets(deviceId: string, reason: string): void {
+  private async closeDeviceSockets(deviceId: string, reason: string): Promise<void> {
     for (const [socket, state] of this.socketStates) {
       if (state.deviceId === deviceId) socket.close(4001, reason);
     }
+    if (/expired|revoked|unavailable/i.test(reason)) await this.management.removeDevice(deviceId);
   }
 
   private async recheckConnectedDevices(): Promise<void> {
     const deviceIds = [...new Set([
       ...[...this.socketStates.values()].map((state) => state.deviceId),
-      ...(this.options.routingReferences ? this.options.auth.list().map(device => device.id) : []),
+      ...this.management.ownerDeviceIds(),
+      ...(this.options.routingReferences ? this.options.auth.list().map((device) => device.id) : []),
     ])];
     await Promise.all(deviceIds.map(async (deviceId) => {
       try {
         if (!await this.options.auth.isActive(deviceId)) {
-          this.closeDeviceSockets(deviceId, "Device credential expired or revoked");
+          await this.closeDeviceSockets(deviceId, "Device credential expired or revoked");
           await this.options.routingReferences?.revokeDevice(deviceId);
         }
       } catch (error) {
         console.error(`Could not recheck device ${deviceId}: ${messageOf(error)}`);
       }
     }));
+  }
+}
+
+export async function hydrateTurnsPage(
+  codex: Pick<CodexAppServer, "call">,
+  params: Record<string, unknown>,
+  value: unknown,
+  sessionRoot?: string,
+): Promise<unknown> {
+  if (!isObject(value) || !Array.isArray(value.data) || value.data.length === 0 || typeof params.threadId !== "string") return value;
+  try {
+    const metadata = await codex.call("thread/read", { threadId: params.threadId, includeTurns: false });
+    if (!isObject(metadata) || !isObject(metadata.thread)) return value;
+    const envelope = { thread: { ...metadata.thread, turns: value.data } };
+    await hydrateThreadHistory(envelope, sessionRoot);
+    return { ...value, data: envelope.thread.turns };
+  } catch {
+    return value;
   }
 }
 
@@ -893,6 +1025,39 @@ export function projectAccountStatus(value: unknown): Record<string, unknown> {
     planType: account && typeof account.planType === "string" ? account.planType : null,
     credentialSource: account && typeof account.credentialSource === "string" ? account.credentialSource : null,
   };
+}
+
+export function projectAccountUsage(
+  limits: PromiseSettledResult<unknown>,
+  usage: PromiseSettledResult<unknown>,
+): Record<string, unknown> {
+  return {
+    rateLimits: limits.status === "fulfilled"
+      ? { supported: true, data: projectUsageValue(limits.value, new Set([
+        "rateLimits", "rateLimitsByLimitId", "rateLimitResetCredits", "limitId", "limitName", "primary", "secondary",
+        "usedPercent", "windowDurationMins", "resetsAt", "credits", "hasCredits", "unlimited", "balance",
+        "individualLimit", "limit", "used", "remainingPercent", "spendControlReached", "planType", "rateLimitReachedType",
+        "availableCount", "resetType", "status", "grantedAt", "expiresAt", "title", "description",
+      ])) }
+      : { supported: false, error: featureError("Account rate limits", limits.reason) },
+    tokenUsage: usage.status === "fulfilled"
+      ? { supported: true, data: projectUsageValue(usage.value, new Set([
+        "summary", "dailyUsageBuckets", "lifetimeTokens", "peakDailyTokens", "longestRunningTurnSec",
+        "currentStreakDays", "longestStreakDays", "startDate", "tokens",
+      ])) }
+      : { supported: false, error: featureError("Account token usage", usage.reason) },
+  };
+}
+
+function projectUsageValue(value: unknown, allowed: ReadonlySet<string>, depth = 0, dynamicKeys = false): unknown {
+  if (depth > 8) return null;
+  if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "string") return value.slice(0, 1000);
+  if (Array.isArray(value)) return value.slice(0, 400).map((item) => projectUsageValue(item, allowed, depth + 1));
+  if (!isObject(value)) return null;
+  return Object.fromEntries(Object.entries(value).filter(([key]) => allowed.has(key) || dynamicKeys)
+    .slice(0, 400).map(([key, item]) => [key.slice(0, 128), projectUsageValue(item, allowed, depth + 1, key === "rateLimitsByLimitId")]));
 }
 
 export function projectInstalledApps(value: unknown): Record<string, unknown> {
@@ -1046,8 +1211,107 @@ function messageOf(error: unknown): string {
   return String(publicPayload(error instanceof Error ? error.message : String(error), "error"));
 }
 
+function featureError(feature: string, error: unknown): string {
+  const message = messageOf(error);
+  if (/method not found|not supported|unsupported|unknown method/i.test(message)) {
+    return `${feature} is unavailable on this Codex version`;
+  }
+  return `${feature} is unavailable: ${message}`;
+}
+
+export function validateRealtimeParams(method: string, params: Record<string, unknown>): Record<string, unknown> {
+  if (!method.startsWith("thread/realtime/")) return params;
+  if (method === "thread/realtime/listVoices") {
+    if (Object.keys(params).length > 0) throw new Error("Realtime voice listing takes no parameters");
+    return {};
+  }
+  const threadId = typeof params.threadId === "string" && params.threadId.length <= 256 ? params.threadId : "";
+  if (!threadId) throw new Error("A valid threadId is required");
+  if (method === "thread/realtime/start") {
+    const allowed = new Set(["threadId", "outputModality", "transport", "voice", "includeStartupContext", "version", "model", "prompt", "initialItems"]);
+    const unknown = Object.keys(params).find((key) => !allowed.has(key));
+    if (unknown) throw new Error(`Realtime start option is not allowed: ${unknown}`);
+    if (!isObject(params.transport) || params.transport.type !== "websocket" || Object.keys(params.transport).length !== 1) {
+      throw new Error("Remote realtime requires websocket transport");
+    }
+    if (!['text', 'audio'].includes(String(params.outputModality))) throw new Error("Realtime outputModality is invalid");
+    const result: Record<string, unknown> = { threadId, outputModality: params.outputModality, transport: { type: "websocket" } };
+    if (params.voice !== undefined && params.voice !== null) {
+      if (typeof params.voice !== "string" || params.voice.length > 100 || !/^[A-Za-z0-9._-]+$/.test(params.voice)) throw new Error("Realtime voice is invalid");
+      result.voice = params.voice;
+    }
+    if (params.includeStartupContext !== undefined && params.includeStartupContext !== null) {
+      if (typeof params.includeStartupContext !== "boolean") throw new Error("Realtime includeStartupContext must be boolean");
+      result.includeStartupContext = params.includeStartupContext;
+    }
+    if (params.version !== undefined && params.version !== null) {
+      if (!["v1", "v2", "v3"].includes(String(params.version))) throw new Error("Realtime version is invalid");
+      result.version = params.version;
+    }
+    if (params.model !== undefined && params.model !== null) {
+      if (typeof params.model !== "string" || !params.model || params.model.length > 200 || /[\0\r\n]/.test(params.model)) throw new Error("Realtime model is invalid");
+      result.model = params.model;
+    }
+    if (params.prompt !== undefined && params.prompt !== null) {
+      if (typeof params.prompt !== "string" || params.prompt.length > 16_000 || /\0/.test(params.prompt)) throw new Error("Realtime prompt is invalid");
+      result.prompt = params.prompt;
+    }
+    if (params.initialItems !== undefined && params.initialItems !== null) {
+      if (params.version !== "v3") throw new Error("Realtime initialItems require version v3");
+      if (!Array.isArray(params.initialItems) || params.initialItems.length > 128) throw new Error("Realtime initialItems exceed the 128 item limit");
+      let estimatedTokens = 0;
+      result.initialItems = params.initialItems.map((item) => {
+        if (!isObject(item) || !["user", "developer", "assistant"].includes(String(item.role))
+          || typeof item.text !== "string" || !item.text || item.text.length > 16_000 || /\0/.test(item.text)
+          || Object.keys(item).some((key) => key !== "role" && key !== "text")) throw new Error("Realtime initial item is invalid");
+        estimatedTokens += Math.max([...item.text].length, Math.ceil(Buffer.byteLength(item.text, "utf8") / 4));
+        return { role: item.role, text: item.text };
+      });
+      if (estimatedTokens > 8_192) throw new Error("Realtime initialItems exceed the 8192 estimated token limit");
+    }
+    return result;
+  }
+  if (method === "thread/realtime/appendAudio") {
+    if (!isObject(params.audio) || typeof params.audio.data !== "string" || params.audio.data.length > 350_000
+      || !/^[A-Za-z0-9+/]*={0,2}$/.test(params.audio.data)) throw new Error("Realtime audio is invalid");
+    const bytes = Buffer.from(params.audio.data, "base64");
+    if (bytes.length === 0 || bytes.length > 256 * 1024 || bytes.length % 2 !== 0) throw new Error("Realtime audio must contain at most 256 KiB of PCM16LE");
+    if (params.audio.sampleRate !== 24_000 || params.audio.numChannels !== 1) throw new Error("Realtime audio must be mono PCM16LE at 24 kHz");
+    if (params.audio.samplesPerChannel !== null && params.audio.samplesPerChannel !== bytes.length / 2) throw new Error("Realtime audio sample count does not match its bytes");
+    const itemId = params.audio.itemId;
+    if (itemId !== null && itemId !== undefined && (typeof itemId !== "string" || itemId.length > 256)) throw new Error("Realtime audio itemId is invalid");
+    return { threadId, audio: { data: params.audio.data, sampleRate: 24_000, numChannels: 1,
+      samplesPerChannel: bytes.length / 2, itemId: itemId ?? null } };
+  }
+  if (method === "thread/realtime/appendText") {
+    if (params.role !== "user") throw new Error("Remote realtime text role must be user");
+    if (typeof params.text !== "string" || !params.text || params.text.length > 16_000) throw new Error("Realtime text must contain 1-16000 characters");
+    return { threadId, text: params.text, role: "user" };
+  }
+  if (method === "thread/realtime/appendSpeech") {
+    if (typeof params.text !== "string" || !params.text || params.text.length > 16_000) throw new Error("Realtime speech must contain 1-16000 characters");
+    return { threadId, text: params.text };
+  }
+  if (method === "thread/realtime/stop") return { threadId };
+  return params;
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function assertExactKeys(value: Record<string, unknown>, allowed: readonly string[], label: string): void {
+  const unknown = Object.keys(value).find((key) => !allowed.includes(key));
+  if (unknown) throw new Error(`${label} parameter is not allowed: ${unknown}`);
+}
+
+function requestFingerprint(value: unknown): string {
+  const canonical = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(canonical);
+    if (isObject(item)) return Object.fromEntries(Object.keys(item).sort().map((key) => [key, canonical(item[key])]));
+    return item;
+  };
+  return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
 }
 
 function attachmentErrorCode(error: unknown): string {
@@ -1055,6 +1319,6 @@ function attachmentErrorCode(error: unknown): string {
   if (/Unsupported attachment type/.test(message)) return "unsupported_type";
   if (/quota/.test(message)) return "quota_exceeded";
   if (/limit|too large/.test(message)) return "too_large";
-  if (/signature|MIME|UTF-8|binary data|JSON attachment|ZIP directory/.test(message)) return "invalid_content";
+  if (/signature|MIME|UTF-8|binary data|JSON attachment|ZIP directory|Office document|Audio content|Video content/.test(message)) return "invalid_content";
   return "upload_failed";
 }

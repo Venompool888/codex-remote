@@ -11,9 +11,10 @@ class InteractionFormModel(val method: String, params: JSONObject, savedDraft: J
     data class Option(val value: String, val title: String, val description: String = "")
     data class Field(val id: String, val title: String, val description: String, val kind: Kind,
                      val required: Boolean = false, val secret: Boolean = false,
-                     val header: String = "", val options: List<Option> = emptyList())
+                     val header: String = "", val options: List<Option> = emptyList(),
+                     val path: List<String> = listOf(id))
     private data class Answer(var text: String = "", var checked: Boolean = false,
-                              val selected: MutableSet<String> = linkedSetOf())
+                              val selected: MutableSet<String> = linkedSetOf(), var present: Boolean = false)
     private val request = JSONObject(params.toString())
     private val identity = MessageDigest.getInstance("SHA-256").digest((method + "\n" + params).toByteArray())
         .joinToString("") { "%02x".format(it) }
@@ -30,6 +31,7 @@ class InteractionFormModel(val method: String, params: JSONObject, savedDraft: J
         if (websiteUrl != null) " · website request" else " needs input" else "Codex needs your input"
     val message: String = request.optString("message")
     private val constraints = linkedMapOf<String, JSONObject>()
+    private val defaults = linkedMapOf<String, Any>()
     val fields: List<Field> = when {
         websiteUrl != null -> emptyList()
         !isElicitation -> parseQuestions()
@@ -37,17 +39,21 @@ class InteractionFormModel(val method: String, params: JSONObject, savedDraft: J
     }
     private val answers = fields.associate { it.id to Answer() }
 
-    init { restoreDraft(savedDraft) }
+    init {
+        applyDefaults()
+        restoreDraft(savedDraft)
+    }
 
     fun text(id: String): String = answer(id).text
     fun checked(id: String): Boolean = answer(id).checked
     fun selected(id: String): Set<String> = answer(id).selected.toSet()
-    fun setText(id: String, value: String) { answer(id).text = value }
-    fun setChecked(id: String, value: Boolean) { answer(id).checked = value }
+    fun setText(id: String, value: String) { answer(id).apply { text = value; present = true } }
+    fun setChecked(id: String, value: Boolean) { answer(id).apply { checked = value; present = true } }
     fun select(id: String, value: String, selected: Boolean = true) {
         val field = fields.single { it.id == id }
         require(field.options.any { it.value == value }) { "Unknown choice" }
         val answer = answer(id)
+        answer.present = true
         if (field.kind != Kind.MULTIPLE && selected) answer.selected.clear()
         if (selected) answer.selected.add(value) else answer.selected.remove(value)
     }
@@ -56,7 +62,8 @@ class InteractionFormModel(val method: String, params: JSONObject, savedDraft: J
     fun reply(): JSONObject {
         if (websiteUrl != null) return JSONObject().put("action", "accept").put("content", JSONObject.NULL)
         val values = JSONObject()
-        fields.forEach { field -> value(field)?.let { values.put(field.id, it) } }
+        fields.forEach { field -> value(field)?.let { putNested(values, field.path, it) } }
+        if (isElicitation) validateObjectRequirements(request.getJSONObject("requestedSchema"), values)
         return if (isElicitation) JSONObject().put("action", "accept").put("content", values)
         else JSONObject().put("answers", values)
     }
@@ -68,7 +75,7 @@ class InteractionFormModel(val method: String, params: JSONObject, savedDraft: J
         fields.forEach { field ->
             val answer = answer(field.id)
             when (field.kind) {
-                Kind.BOOLEAN -> put(JSONObject().put("checked", answer.checked))
+                Kind.BOOLEAN -> put(JSONObject().put("checked", answer.checked).put("present", answer.present))
                 Kind.SINGLE, Kind.MULTIPLE -> field.options.forEach { put(JSONObject().put("checked", it.value in answer.selected)) }
                 Kind.QUESTION -> {
                     field.options.forEach { put(JSONObject().put("checked", it.value in answer.selected)) }
@@ -98,7 +105,10 @@ class InteractionFormModel(val method: String, params: JSONObject, savedDraft: J
                 if (field.kind != Kind.QUESTION) return@forEach
             }
             val item = controls.optJSONObject(index++) ?: return@forEach
-            if (field.kind == Kind.BOOLEAN) answer.checked = item.optBoolean("checked")
+            if (field.kind == Kind.BOOLEAN) {
+                answer.checked = item.optBoolean("checked")
+                answer.present = item.optBoolean("present", answer.checked || field.required) || answer.present
+            }
             else if (!field.secret && item.has("text")) answer.text = item.optString("text")
         }
     }
@@ -112,7 +122,7 @@ class InteractionFormModel(val method: String, params: JSONObject, savedDraft: J
                 require(text.isNotBlank()) { "Answer every question before submitting" }
                 JSONObject().put("answers", JSONArray().put(text))
             }
-            Kind.BOOLEAN -> answer.checked
+            Kind.BOOLEAN -> if (field.required || answer.present) answer.checked else null
             Kind.SINGLE -> answer.selected.firstOrNull().also {
                 require(!field.required || it != null) { "Complete ${field.id}" }
             }
@@ -140,6 +150,9 @@ class InteractionFormModel(val method: String, params: JSONObject, savedDraft: J
                         else -> true
                     }
                     require(valid) { "Enter a valid $format" }
+                    schema.optString("pattern").takeIf(String::isNotBlank)?.let { pattern ->
+                        require(SafeTextPattern.matches(pattern, value)) { "Enter text matching ${field.title}" }
+                    }
                     value
                 } else {
                     val number = value.toDoubleOrNull()
@@ -169,18 +182,49 @@ class InteractionFormModel(val method: String, params: JSONObject, savedDraft: J
     }
 
     private fun parseSchema(): List<Field> {
-        require(request.optString("mode", "form") in setOf("form", "openai/form")) { "This request requires authorization on the host" }
+        val mode = request.optString("mode", "form")
+        require(mode in setOf("form", "openai/form")) { "This request requires authorization on the host" }
         val schema = request.getJSONObject("requestedSchema")
         require(schema.optString("type") == "object") { "Unsupported form; complete it on the host" }
+        val result = mutableListOf<Field>()
+        parseObjectSchema(schema, emptyList(), emptyList(), parentRequired = true, allowNested = mode == "openai/form", result)
+        require(result.size <= 30) { "This form is too large; complete it on the host" }
+        return result
+    }
+
+    private fun parseObjectSchema(
+        schema: JSONObject,
+        path: List<String>,
+        titles: List<String>,
+        parentRequired: Boolean,
+        allowNested: Boolean,
+        result: MutableList<Field>,
+    ) {
+        require(schema.optString("type") == "object" && schema.opt("additionalProperties") != true) {
+            "Unsupported form object; complete it on the host"
+        }
+        require(path.size <= 4) { "This form is too deeply nested; complete it on the host" }
         val properties = schema.optJSONObject("properties") ?: JSONObject()
-        require(properties.length() <= 30) { "This form is too large; complete it on the host" }
-        val required = schema.optJSONArray("required") ?: JSONArray()
-        val requiredKeys = (0 until required.length()).map { required.getString(it) }.toSet()
-        return properties.keys().asSequence().map { id ->
-            val spec = properties.getJSONObject(id)
-            require(!spec.has("pattern") && spec.optString("format") in setOf("", "email", "uri", "date", "date-time")) {
+        val requiredArray = schema.optJSONArray("required") ?: JSONArray()
+        val requiredKeys = (0 until requiredArray.length()).map { requiredArray.getString(it) }.toSet()
+        properties.keys().asSequence().forEach { key ->
+            val spec = properties.getJSONObject(key)
+            val fieldPath = path + key
+            val titlePath = titles + spec.optString("title", key)
+            val required = parentRequired && key in requiredKeys
+            if (spec.optString("type") == "object") {
+                require(allowNested) { "Unsupported form field; complete it on the host" }
+                parseObjectSchema(spec, fieldPath, titlePath, required, allowNested, result)
+                return@forEach
+            }
+            require(spec.optString("format") in setOf("", "email", "uri", "date", "date-time")) {
                 "Unsupported text constraint; complete it on the host"
             }
+            spec.optString("pattern").takeIf(String::isNotBlank)?.let {
+                require(allowNested) { "Unsupported text constraint; complete it on the host" }
+                SafeTextPattern.requireSupported(it)
+            }
+            val id = if (fieldPath.size == 1) key else fieldPath.joinToString("/") { it.replace("~", "~0").replace("/", "~1") }
             constraints[id] = spec
             val type = spec.optString("type")
             val multiple = type == "array"
@@ -208,7 +252,60 @@ class InteractionFormModel(val method: String, params: JSONObject, savedDraft: J
                         ?: names?.optString(i)?.takeIf(String::isNotBlank) ?: value)
                 }.also { require(it.map(Option::value).distinct().size == it.size) { "Duplicate choices; complete it on the host" } }
             } else emptyList()
-            Field(id, spec.optString("title", id), spec.optString("description", id), kind, id in requiredKeys, options = choices)
-        }.toList()
+            val secret = spec.optBoolean("writeOnly") || spec.optBoolean("secret") || spec.optBoolean("x-secret")
+            result += Field(
+                id = id,
+                title = titlePath.joinToString(" · "),
+                description = spec.optString("description", titlePath.last()),
+                kind = kind,
+                required = required,
+                secret = secret,
+                options = choices,
+                path = fieldPath,
+            )
+            if (spec.has("default") && !spec.isNull("default")) defaults[id] = spec.get("default")
+        }
+    }
+
+    private fun applyDefaults() {
+        fields.forEach { field ->
+            val default = defaults[field.id] ?: return@forEach
+            val answer = answer(field.id)
+            when (field.kind) {
+                Kind.BOOLEAN -> answer.checked = default as? Boolean ?: return@forEach
+                Kind.SINGLE -> (default as? String)?.takeIf { value -> field.options.any { it.value == value } }
+                    ?.let(answer.selected::add) ?: return@forEach
+                Kind.MULTIPLE -> {
+                    val values = default as? JSONArray ?: return@forEach
+                    for (index in 0 until values.length()) values.optString(index)
+                        .takeIf { value -> field.options.any { it.value == value } }?.let(answer.selected::add)
+                }
+                else -> answer.text = default.toString()
+            }
+            answer.present = true
+        }
+    }
+
+    private fun putNested(root: JSONObject, path: List<String>, value: Any) {
+        var target = root
+        path.dropLast(1).forEach { segment ->
+            target = target.optJSONObject(segment) ?: JSONObject().also { target.put(segment, it) }
+        }
+        target.put(path.last(), value)
+    }
+
+    private fun validateObjectRequirements(schema: JSONObject, value: JSONObject) {
+        val required = schema.optJSONArray("required") ?: JSONArray()
+        for (index in 0 until required.length()) {
+            require(value.has(required.getString(index))) { "Complete ${required.getString(index)}" }
+        }
+        val properties = schema.optJSONObject("properties") ?: return
+        properties.keys().asSequence().forEach { key ->
+            val childSchema = properties.optJSONObject(key) ?: return@forEach
+            if (childSchema.optString("type") == "object" && value.has(key)) {
+                val child = value.optJSONObject(key) ?: throw IllegalArgumentException("Complete $key")
+                validateObjectRequirements(childSchema, child)
+            }
+        }
     }
 }

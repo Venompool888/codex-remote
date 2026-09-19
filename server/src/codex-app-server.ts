@@ -20,6 +20,7 @@ interface PendingCall {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
+  child: ChildProcessWithoutNullStreams;
 }
 
 export class CodexAppServer extends EventEmitter {
@@ -27,6 +28,7 @@ export class CodexAppServer extends EventEmitter {
   private nextId = 1;
   private pending = new Map<number, PendingCall>();
   private stopping = false;
+  private starting: Promise<void> | null = null;
   private desktop?: DesktopOwnerBridge;
   private externalTokens: ChatGptTokens | undefined;
 
@@ -44,8 +46,19 @@ export class CodexAppServer extends EventEmitter {
   }
 
   async start(): Promise<void> {
+    if (this.starting) return this.starting;
     if (this.child) return;
     if (this.tokenProvider && this.useDaemonProxy) throw new Error("External CLI auth requires a dedicated app-server");
+    const starting = this.startChild();
+    this.starting = starting;
+    try {
+      await starting;
+    } finally {
+      if (this.starting === starting) this.starting = null;
+    }
+  }
+
+  private async startChild(): Promise<void> {
     this.stopping = false;
     const appServerArgs = this.useDaemonProxy
       ? ["app-server", "proxy", ...this.extraArgs]
@@ -59,31 +72,43 @@ export class CodexAppServer extends EventEmitter {
 
     createInterface({ input: child.stdout }).on("line", (line) => this.handleLine(line));
     createInterface({ input: child.stderr }).on("line", (line) => this.emit("log", line));
-    child.once("error", (error) => this.failAll(error));
+    child.once("error", (error) => this.failAllForChild(child, error));
     child.once("exit", (code, signal) => {
-      this.child = null;
+      const wasCurrent = this.child === child;
+      if (wasCurrent) this.child = null;
       const error = new Error(`codex app-server exited (code=${code ?? "null"}, signal=${signal ?? "null"})`);
-      this.failAll(error);
-      if (!this.stopping) this.emit("exit", error);
+      this.failAllForChild(child, error);
+      if (wasCurrent && !this.stopping) this.emit("exit", error);
     });
 
-    await this.call("initialize", {
-      clientInfo: {
-        name: "codex_remote_host",
-        title: "Codex Remote Host",
-        version: "0.1.0",
-      },
-      capabilities: { experimentalApi: true },
-    });
-    this.notify("initialized", {});
-    if (this.tokenProvider) {
-      try {
+    let authenticating = false;
+    try {
+      await this.call("initialize", {
+        clientInfo: {
+          name: "codex_remote_host",
+          title: "Codex Remote Host",
+          version: "0.1.0",
+        },
+        capabilities: { experimentalApi: true },
+      });
+      if (this.child !== child) throw new Error("codex app-server stopped during initialization");
+      this.sendTo(child, { method: "initialized", params: {} });
+      if (this.tokenProvider) {
+        authenticating = true;
         this.externalTokens = await this.tokenProvider();
         await this.call("account/login/start", { type: "chatgptAuthTokens", ...this.externalTokens });
-      } catch {
-        await this.stop();
-        throw new Error("Could not use host CLI authentication");
       }
+    } catch (error) {
+      this.externalTokens = undefined;
+      const failure = authenticating
+        ? new Error("Could not use host CLI authentication")
+        : error instanceof Error ? error : new Error(String(error));
+      if (authenticating) {
+        this.stopping = true;
+        this.desktop?.stop();
+      }
+      await this.terminateChild(child, failure);
+      throw failure;
     }
   }
 
@@ -102,15 +127,17 @@ export class CodexAppServer extends EventEmitter {
   }
 
   private callDirect(method: string, params: unknown, timeoutMs = 30_000): Promise<unknown> {
+    const child = this.child;
+    if (!child?.stdin.writable) return Promise.reject(new Error("codex app-server is not running"));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`Codex request timed out: ${method}`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timeout });
+      this.pending.set(id, { resolve, reject, timeout, child });
       try {
-        this.send({ id, method, params });
+        this.sendTo(child, { id, method, params });
       } catch (error) {
         clearTimeout(timeout);
         this.pending.delete(id);
@@ -133,8 +160,14 @@ export class CodexAppServer extends EventEmitter {
     this.desktop?.stop();
     this.externalTokens = undefined;
     const child = this.child;
-    this.child = null;
     if (!child) return;
+    await this.terminateChild(child, new Error("codex app-server stopped"));
+  }
+
+  private async terminateChild(child: ChildProcessWithoutNullStreams, error: Error): Promise<void> {
+    if (this.child === child) this.child = null;
+    this.failAllForChild(child, error);
+    if (child.exitCode !== null || child.signalCode !== null) return;
     child.kill("SIGTERM");
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
@@ -149,8 +182,14 @@ export class CodexAppServer extends EventEmitter {
   }
 
   private send(message: object): void {
-    if (!this.child?.stdin.writable) throw new Error("codex app-server is not running");
-    this.child.stdin.write(`${JSON.stringify(message)}\n`);
+    const child = this.child;
+    if (!child) throw new Error("codex app-server is not running");
+    this.sendTo(child, message);
+  }
+
+  private sendTo(child: ChildProcessWithoutNullStreams, message: object): void {
+    if (!child.stdin.writable) throw new Error("codex app-server is not running");
+    child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
   private handleLine(line: string): void {
@@ -206,11 +245,12 @@ export class CodexAppServer extends EventEmitter {
     }
   }
 
-  private failAll(error: Error): void {
-    for (const pending of this.pending.values()) {
+  private failAllForChild(child: ChildProcessWithoutNullStreams, error: Error): void {
+    for (const [id, pending] of this.pending) {
+      if (pending.child !== child) continue;
       clearTimeout(pending.timeout);
       pending.reject(error);
+      this.pending.delete(id);
     }
-    this.pending.clear();
   }
 }

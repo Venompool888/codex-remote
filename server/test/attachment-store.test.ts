@@ -89,6 +89,32 @@ test("resumes a text upload by offset and verifies whole-file integrity", async 
   }
 });
 
+test("validated audio and video uploads retain their media kinds", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codex-media-attachments-"));
+  try {
+    const store = new AttachmentStore(directory);
+    for (const fixture of [
+      { name: "voice.mp3", mimeType: "audio/mpeg", bytes: Buffer.from("ID3\u0004\u0000\u0000media") , kind: "audio" },
+      { name: "clip.mp4", mimeType: "video/mp4", bytes: Buffer.from([0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]), kind: "video" },
+    ]) {
+      const created = await store.init("pixel", { ...fixture, size: fixture.bytes.length, sha256: sha256(fixture.bytes) });
+      await store.writeChunk("pixel", created.id, 0, fixture.bytes.length, fixture.bytes, sha256(fixture.bytes));
+      assert.equal((await store.complete("pixel", created.id)).kind, fixture.kind);
+    }
+    const spoof = Buffer.from("not audio");
+    const created = await store.init("pixel", { name: "spoof.mp3", mimeType: "audio/mpeg", size: spoof.length, sha256: sha256(spoof) });
+    await store.writeChunk("pixel", created.id, 0, spoof.length, spoof, sha256(spoof));
+    await assert.rejects(() => store.complete("pixel", created.id), /Audio content/);
+    const fakeOffice = Buffer.from("PK\u0003\u0004not an office package");
+    const office = await store.init("pixel", { name: "notes.docx",
+      mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      size: fakeOffice.length, sha256: sha256(fakeOffice) });
+    assert.equal(office.kind, "document");
+    await store.writeChunk("pixel", office.id, 0, fakeOffice.length, fakeOffice, sha256(fakeOffice));
+    await assert.rejects(() => store.complete("pixel", office.id), /ZIP directory|Office document/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test("rejects wrong offsets, chunk hashes, whole-file hashes, and MIME spoofing", async () => {
   const directory = await mkdtemp(join(tmpdir(), "codex-attachments-invalid-"));
   try {

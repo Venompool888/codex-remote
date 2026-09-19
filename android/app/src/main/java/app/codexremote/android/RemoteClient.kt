@@ -59,6 +59,12 @@ class RemoteClient(private val listener: Listener, enableOpaqueWorkspaceRouting:
         return (0 until methods.length()).any { methods.optString(it) == method }
     }
 
+    /** New feature panels require explicit advertisement, unlike legacy RPC fallback. */
+    fun advertisedRpcMethods(): Set<String> {
+        val methods = negotiatedCapabilities?.optJSONArray("rpcMethods") ?: return emptySet()
+        return (0 until methods.length()).mapNotNull { methods.optString(it).takeIf(String::isNotBlank) }.toSet()
+    }
+
     fun supportsExperimentalPluginList(): Boolean = negotiatedCapabilities
         ?.optJSONObject("plugins")
         ?.optBoolean("experimentalList", false)
@@ -573,7 +579,7 @@ class RemoteClient(private val listener: Listener, enableOpaqueWorkspaceRouting:
         .replaceFirst("https://", "wss://")
         .replaceFirst("http://", "ws://")
 
-    private companion object {
+    internal companion object {
         const val LOG_TAG = "CodexRemoteProtocol"
         const val MAX_ATTACHMENT_RECOVERY_ATTEMPTS = 3
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
@@ -589,6 +595,17 @@ class RemoteClient(private val listener: Listener, enableOpaqueWorkspaceRouting:
 
         fun isWriteRpc(method: String): Boolean = method.startsWith("turn/") || method in setOf(
             "thread/start", "thread/resume", "thread/fork", "thread/archive", "thread/unarchive",
+            "thread/name/set", "thread/delete", "thread/compact/start", "review/start",
+            "thread/goal/set", "thread/goal/clear",
+            "thread/realtime/start", "thread/realtime/appendAudio", "thread/realtime/appendText",
+            "thread/realtime/appendSpeech", "thread/realtime/stop",
+            "host/account/login/start", "host/account/login/cancel", "host/account/logout",
+            "host/mcp/oauth/start", "host/mcp/reload", "host/plugin/install", "host/plugin/uninstall",
+            "host/settings/set", "host/skill/setEnabled", "host/thread/memoryMode/set",
+            "host/terminal/execute", "host/terminal/write", "host/terminal/resize", "host/terminal/kill",
+            "host/guardian/approveDenied",
+            "host/workspace/text/save", "host/workspace/text/create", "host/memory/reset",
+            "host/thread/backgroundTerminals/terminate", "host/thread/backgroundTerminals/clean",
         )
     }
 }

@@ -15,7 +15,10 @@ class ConversationController(
     private val onOpenModel: () -> Unit = {},
     private val onOpenPermissions: () -> Unit = {},
     private val onRetryLoading: () -> Unit = {},
-    private val onExportDiagnostics: () -> Unit = {}
+    private val onExportDiagnostics: () -> Unit = {},
+    private val onLoadOlderHistory: () -> Unit = {},
+    private val onOpenSubagentDirectory: () -> Unit = {},
+    val subagents: SubagentViewerController = SubagentViewerController()
 ) {
     private val _uiState = mutableStateOf(ConversationUiState())
     val uiState: State<ConversationUiState> = _uiState
@@ -31,6 +34,8 @@ class ConversationController(
         isConnected: Boolean,
         reason: String? = null
     ) {
+        val previous = _uiState.value
+        if (previous.threadId != threadId || previous.serverHost != serverHost || !isConnected) subagents.close()
         _uiState.value = _uiState.value.copy(
             threadId = threadId,
             threadTitle = title,
@@ -49,6 +54,24 @@ class ConversationController(
             isTurnRunning = isTurnRunning,
             isLoading = isThreadLoadPending
         )
+    }
+
+    fun setSubagentDiscoveryAvailable(available: Boolean) {
+        _uiState.value = _uiState.value.copy(canBrowseSubagents = available)
+    }
+    fun openSubagentDirectory() { if (_uiState.value.canBrowseSubagents) onOpenSubagentDirectory() }
+    fun setHistoryPagingUiReady(ready: Boolean) { _uiState.value = _uiState.value.copy(historyPagingUiReady = ready) }
+
+    fun setThreadStatus(status: String) {
+        _uiState.value = _uiState.value.copy(threadStatus = status)
+    }
+
+    fun setHistoryPaging(hasMore: Boolean, loading: Boolean = false, error: String? = null) {
+        _uiState.value = _uiState.value.copy(hasOlderHistory = hasMore, loadingOlderHistory = loading, historyPageError = error)
+    }
+
+    fun loadOlderHistory() {
+        if (_uiState.value.hasOlderHistory && !_uiState.value.loadingOlderHistory) onLoadOlderHistory()
     }
 
     fun setLoading(loading: Boolean) {

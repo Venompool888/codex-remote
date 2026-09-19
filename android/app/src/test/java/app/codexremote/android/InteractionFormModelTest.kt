@@ -8,6 +8,10 @@ class InteractionFormModelTest {
     private fun question(secret: Boolean = false) = JSONObject("""{"questions":[{"id":"choice","question":"Choose","isSecret":$secret,"options":[{"label":"One"},{"label":"Two"}]}]}""")
     private fun form(properties: String, required: String = "[]") = JSONObject("""{"mode":"form","requestedSchema":{"type":"object","properties":$properties,"required":$required}}""")
     private fun model(properties: String, required: String = "[]") = InteractionFormModel("mcpServer/elicitation/request", form(properties, required))
+    private fun openAiModel(properties: String, required: String = "[]") = InteractionFormModel(
+        "mcpServer/elicitation/request",
+        JSONObject("""{"mode":"openai/form","requestedSchema":{"type":"object","properties":$properties,"required":$required}}"""),
+    )
     private fun invalid(action: () -> Unit) { try { action(); fail("Expected validation failure") } catch (_: IllegalArgumentException) {} }
 
     @Test fun noDefaultAnswerAndFreeTextOverridesSelection() {
@@ -82,5 +86,43 @@ class InteractionFormModelTest {
     @Test fun unsupportedSchemaIsRejectedRatherThanDropped() {
         invalid { model("""{"object":{"type":"object"}}""") }
         invalid { model("""{"text":{"type":"string","pattern":"secret"}}""") }
+    }
+
+    @Test fun openAiFormFlattensNestedObjectsAndReconstructsTypedReply() {
+        val model = openAiModel(
+            """{"profile":{"type":"object","title":"Profile","properties":{"name":{"type":"string"},"count":{"type":"integer"}},"required":["name"]}}""",
+            "[\"profile\"]",
+        )
+        assertEquals(listOf("profile/name", "profile/count"), model.fields.map { it.id })
+        model.setText("profile/name", "Yuri")
+        model.setText("profile/count", "3")
+
+        val profile = model.reply().getJSONObject("content").getJSONObject("profile")
+        assertEquals("Yuri", profile.getString("name"))
+        assertEquals(3.0, profile.getDouble("count"), 0.0)
+    }
+
+    @Test fun defaultsOptionalBooleanAndSecretDraftsPreserveProtocolMeaning() {
+        val model = openAiModel(
+            """{"region":{"type":"string","default":"au"},"enabled":{"type":"boolean"},"token":{"type":"string","writeOnly":true}}""",
+        )
+        assertEquals("au", model.text("region"))
+        val initial = model.reply().getJSONObject("content")
+        assertEquals("au", initial.getString("region"))
+        assertFalse(initial.has("enabled"))
+        model.setChecked("enabled", false)
+        model.setText("token", "do-not-save")
+        val draft = model.saveDraft()
+        assertFalse(draft.toString().contains("do-not-save"))
+        assertFalse(model.reply().getJSONObject("content").getBoolean("enabled"))
+    }
+
+    @Test fun openAiFormSupportsBoundedPatternsAndRejectsUnsafeRegexFeatures() {
+        val model = openAiModel("""{"code":{"type":"string","pattern":"^[A-Z]{2}[0-9]{4}$"}}""", "[\"code\"]")
+        model.setText("code", "bad"); invalid { model.reply() }
+        model.setText("code", "AU2026")
+        assertEquals("AU2026", model.reply().getJSONObject("content").getString("code"))
+        invalid { openAiModel("""{"code":{"type":"string","pattern":"^(a+)+$"}}""") }
+        invalid { openAiModel("""{"code":{"type":"string","pattern":"(a|aa)+"}}""") }
     }
 }

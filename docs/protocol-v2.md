@@ -57,3 +57,21 @@ The Remote protocol is independent from the Codex App Server protocol. The Host 
 Protocol v2 requires `idempotencyKey` on RPC methods guarded by `rpc:write`. Android uses the stable client request id as that key and retains unconfirmed write messages while reconnecting to the same Host session. The Host caches the in-flight promise and final outcome for 24 hours per device, method, and key, so a lost response cannot duplicate a turn or archive action. Pending writes are deliberately not replayed after a Host process restart, because the in-memory outcome ledger is no longer authoritative; Android surfaces an explicit unconfirmed-operation error instead.
 
 Capability flags must change in the same release as their implementation and tests.
+
+
+## Workspace text mutations
+
+`host/workspace/text/save` and `host/workspace/text/create` require v2 write
+idempotency, the selected workspace, and a confirmation matching the exact
+relative target path. Clients must use the advertised RPC list and
+`workspaceMutations.textSave`; these methods are unavailable on macOS and other
+platforms without Linux descriptor-relative `/proc/self/fd` traversal.
+
+On supported Linux hosts, every directory component is opened with no-follow
+semantics. Creation publishes a fully written temporary file without replacing
+an existing name. Save validates the expected SHA-256 and writes the same opened
+regular file, rejecting multiple hard links and preserving mode. This is
+optimistic conflict detection, not an exclusive lock against other editors.
+Save is in-place and is not crash-atomic: interruption can leave partial content.
+The text limit is 512 KiB. The platform-specific write tests must run on Linux;
+macOS validates the unavailable capability and fail-closed behavior.

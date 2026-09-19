@@ -674,4 +674,66 @@ class ThreadProjectionTest {
         )
         assertEquals("+alpha", execution.children.first().fileChanges.single().patch)
     }
+
+    @Test
+    fun projectsPreviouslyMissingTimelineItemVariants() {
+        val hook = ThreadProjection.projectItem(JSONObject()
+            .put("id", "hook-prompt")
+            .put("type", "hookPrompt")
+            .put("fragments", JSONArray()
+                .put(JSONObject().put("text", "First").put("hookRunId", "run-1"))
+                .put(JSONObject().put("text", "Second").put("hookRunId", "run-2"))))
+        val sleep = ThreadProjection.projectItem(JSONObject()
+            .put("id", "sleep-1").put("type", "sleep").put("durationMs", 1_500))
+        val entered = ThreadProjection.projectItem(JSONObject()
+            .put("id", "review-in").put("type", "enteredReviewMode").put("review", "Check auth"))
+        val exited = ThreadProjection.projectItem(JSONObject()
+            .put("id", "review-out").put("type", "exitedReviewMode").put("review", "Check auth"))
+
+        assertEquals("First\nSecond", hook?.text)
+        assertEquals("Waited 1s", sleep?.label)
+        assertEquals(1_500L, sleep?.durationMs)
+        assertEquals("Entered review mode", entered?.label)
+        assertEquals("Exited review mode", exited?.label)
+    }
+
+    @Test
+    fun dynamicToolKeepsTextAndRichOutputReferencesWithoutLoadingThem() {
+        val item = ThreadProjection.projectItem(JSONObject()
+            .put("id", "rich-1")
+            .put("type", "dynamicToolCall")
+            .put("tool", "inspect_media")
+            .put("status", "completed")
+            .put("contentItems", JSONArray()
+                .put(JSONObject().put("type", "inputText").put("text", "Transcript"))
+                .put(JSONObject().put("type", "inputImage").put("imageUrl", "https://example.invalid/image.png"))
+                .put(JSONObject().put("type", "inputAudio").put("audioUrl", "data:audio/wav;base64,AA=="))))
+
+        assertEquals("Transcript", item?.text)
+        assertEquals(
+            listOf(RichOutputReference.Kind.IMAGE, RichOutputReference.Kind.AUDIO),
+            item?.richOutputReferences?.map { it.kind },
+        )
+        assertEquals("https://example.invalid/image.png", item?.richOutputReferences?.first()?.source)
+    }
+
+    @Test
+    fun aggregateTurnDiffProducesFileSummaryUsedByActivityGroup() {
+        val summary = ThreadProjection.turnDiffSummary(
+            "diff --git a/a.kt b/a.kt\n--- a/a.kt\n+++ b/a.kt\n@@ -1 +1,2 @@\n-old\n+new\n+extra\n" +
+                "diff --git a/b.kt b/b.kt\n--- a/b.kt\n+++ b/b.kt\n@@ -1 +0,0 @@\n-gone\n",
+        )
+        val thread = JSONObject().put("turns", JSONArray().put(JSONObject()
+            .put("id", "turn-summary").put("status", "completed").put("items", JSONArray())))
+        val timeline = ThreadProjection.timeline(
+            thread,
+            mapOf("turn-summary" to LiveTurnSnapshot("completed", emptyList(), turnDiff = summary)),
+        )
+
+        assertEquals(setOf("a.kt", "b.kt"), summary?.changedFiles)
+        assertEquals(2, summary?.additions)
+        assertEquals(2, summary?.deletions)
+        assertEquals(2, timeline.single().filesChanged)
+        assertEquals(summary?.fileChanges, timeline.single().fileChanges)
+    }
 }

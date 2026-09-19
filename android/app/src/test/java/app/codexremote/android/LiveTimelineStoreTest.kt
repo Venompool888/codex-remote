@@ -359,6 +359,117 @@ class LiveTimelineStoreTest {
         assertFalse(item.active)
     }
 
+    @Test
+    fun structuredPlanUpdateReplacesStepsAndExposesProgress() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID)))
+        store.record("turn/plan/updated", params()
+            .put("explanation", "Implementation plan")
+            .put("plan", JSONArray()
+                .put(JSONObject().put("step", "Inspect").put("status", "completed"))
+                .put(JSONObject().put("step", "Implement").put("status", "inProgress"))
+                .put(JSONObject().put("step", "Verify").put("status", "pending"))))
+
+        val plan = store.snapshots(THREAD_ID).getValue(TURN_ID).items.single()
+        assertEquals(listOf("completed", "inProgress", "pending"), plan.planSteps.map { it.status })
+        assertEquals(1, plan.stepCurrent)
+        assertEquals(3, plan.stepTotal)
+        assertTrue(plan.active)
+        assertTrue(plan.text.contains("→ Implement"))
+    }
+
+    @Test
+    fun approvalReviewPreservesStructuredDecisionHistory() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID)))
+        val started = params()
+            .put("reviewId", "review-1")
+            .put("startedAtMs", 1_000)
+            .put("targetItemId", "command-1")
+            .put("review", JSONObject().put("status", "inProgress"))
+            .put("action", JSONObject().put("type", "command").put("command", "git status").put("cwd", "/repo"))
+        assertTrue(store.record("item/autoApprovalReview/started", started))
+        assertTrue(store.snapshots(THREAD_ID).getValue(TURN_ID).items.single().active)
+
+        val completed = JSONObject(started.toString())
+            .put("completedAtMs", 1_125)
+            .put("decisionSource", "agent")
+            .put("review", JSONObject()
+                .put("status", "approved")
+                .put("riskLevel", "low")
+                .put("userAuthorization", "high")
+                .put("rationale", "Already authorized"))
+        store.record("item/autoApprovalReview/completed", completed)
+
+        val item = store.snapshots(THREAD_ID).getValue(TURN_ID).items.single()
+        assertFalse(item.active)
+        assertEquals("approved", item.approvalReview?.status)
+        assertEquals("command", item.approvalReview?.actionType)
+        assertEquals("git status", item.approvalReview?.actionSummary)
+        assertEquals(125L, item.durationMs)
+    }
+
+    @Test
+    fun mcpProgressIsIncrementalAndCompletionKeepsRichReferences() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID)))
+        store.record("item/started", params(item = JSONObject()
+            .put("id", "mcp-1").put("type", "mcpToolCall")
+            .put("server", "media").put("tool", "inspect").put("status", "inProgress")))
+        store.record("item/mcpToolCall/progress", params(itemId = "mcp-1").put("message", "Uploading"))
+        store.record("item/mcpToolCall/progress", params(itemId = "mcp-1").put("message", "Processing"))
+        assertEquals("Uploading\nProcessing", store.snapshots(THREAD_ID).getValue(TURN_ID).items.single().text)
+
+        store.record("item/completed", params(item = JSONObject()
+            .put("id", "mcp-1").put("type", "mcpToolCall")
+            .put("server", "media").put("tool", "inspect").put("status", "completed")
+            .put("result", JSONObject().put("content", JSONArray()
+                .put(JSONObject().put("type", "text").put("text", "Done"))
+                .put(JSONObject().put("type", "image").put("data", "base64-data").put("mimeType", "image/png"))))))
+
+        val completed = store.snapshots(THREAD_ID).getValue(TURN_ID).items.single()
+        assertEquals("Done", completed.text)
+        assertEquals(RichOutputReference.Kind.IMAGE, completed.richOutputReferences.single().kind)
+        assertEquals("base64-data", completed.richOutputReferences.single().source)
+    }
+
+    @Test
+    fun hookWithoutTurnUsesOnlyExplicitThreadScope() {
+        val store = LiveTimelineStore()
+        val hook = JSONObject().put("turnId", JSONObject.NULL).put("run", JSONObject()
+            .put("id", "hook-1")
+            .put("eventName", "postToolUse")
+            .put("status", "completed")
+            .put("statusMessage", "Checks passed")
+            .put("startedAt", 100)
+            .put("durationMs", 20)
+            .put("entries", JSONArray()))
+
+        assertFalse(store.record("hook/completed", hook))
+        assertTrue(store.record("hook/completed", hook, scopedThreadId = THREAD_ID))
+        assertTrue(store.snapshots("other-thread").isEmpty())
+        val snapshot = store.snapshots(THREAD_ID).values.single()
+        assertEquals("completed", snapshot.status)
+        assertEquals("Post Tool Use hook", snapshot.items.single().label)
+    }
+
+    @Test
+    fun warningsRerouteAndTurnDiffStayScopedToTheirThread() {
+        val store = LiveTimelineStore()
+        store.record("turn/started", params(turn = JSONObject().put("id", TURN_ID)))
+        store.record("warning", JSONObject().put("threadId", THREAD_ID).put("message", "Heads up"))
+        store.record("model/rerouted", params().put("fromModel", "a").put("toModel", "b")
+            .put("reason", "highRiskCyberActivity"))
+        store.record("turn/diff/updated", params().put("diff",
+            "diff --git a/a.kt b/a.kt\n--- a/a.kt\n+++ b/a.kt\n@@ -1 +1 @@\n-old\n+new\n"))
+
+        val snapshot = store.snapshots(THREAD_ID).getValue(TURN_ID)
+        assertTrue(snapshot.items.any { it.label == "Warning" })
+        assertTrue(snapshot.items.any { it.label == "Model rerouted" })
+        assertEquals(setOf("a.kt"), snapshot.turnDiff?.changedFiles)
+        assertTrue(store.snapshots("other-thread").isEmpty())
+    }
+
     private fun recordCompleted(store: LiveTimelineStore, item: JSONObject) {
         store.record("item/started", params(item = JSONObject(item.toString())))
         store.record("item/completed", params(item = item))

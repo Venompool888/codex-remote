@@ -43,6 +43,42 @@ internal fun JSONObject.displayPath(field: String = "path"): String {
 
 data class MessageAttachment(val id: String, val name: String, val kind: String)
 
+data class PlanStep(
+    val text: String,
+    val status: String,
+)
+
+data class RichOutputReference(
+    val kind: Kind,
+    val source: String,
+    val mimeType: String? = null,
+) {
+    enum class Kind { IMAGE, AUDIO, RESOURCE }
+}
+
+data class ApprovalReviewDetails(
+    val reviewId: String,
+    val targetItemId: String? = null,
+    val status: String,
+    val riskLevel: String? = null,
+    val userAuthorization: String? = null,
+    val rationale: String? = null,
+    val actionType: String,
+    val actionSummary: String,
+    val decisionSource: String? = null,
+    val startedAtEpochMs: Long? = null,
+    val completedAtEpochMs: Long? = null,
+)
+
+data class TurnDiffSummary(
+    val patch: String,
+    val changedFiles: Set<String>,
+    val fileDiffs: Map<String, FileDiffStat>,
+    val fileChanges: List<FileDiffDetail>,
+    val additions: Int,
+    val deletions: Int,
+)
+
 data class TimelineItem(
     val id: String,
     val label: String,
@@ -66,6 +102,10 @@ data class TimelineItem(
     val deletions: Int = 0,
     val imagePath: String? = null,
     val attachments: List<MessageAttachment> = emptyList(),
+    val subagents: List<SubagentReference> = emptyList(),
+    val planSteps: List<PlanStep> = emptyList(),
+    val richOutputReferences: List<RichOutputReference> = emptyList(),
+    val approvalReview: ApprovalReviewDetails? = null,
 ) {
     enum class ToolStyle { GENERIC, WEB, INTEGRATION, READ, SEARCH, SKILL }
 
@@ -89,6 +129,7 @@ data class LiveTurnSnapshot(
     val status: String,
     val items: List<TimelineItem>,
     val startedAtEpochMs: Long? = null,
+    val turnDiff: TurnDiffSummary? = null,
 )
 
 object ThreadProjection {
@@ -174,6 +215,7 @@ object ThreadProjection {
                 startedAtEpochMs = liveTurn?.startedAtEpochMs ?: turnStartedAtMs(turn),
                 snapshotItems = turn.optJSONArray("items").objects().mapNotNull(::projectItem),
                 liveItems = liveTurn?.items.orEmpty(),
+                turnDiff = liveTurn?.turnDiff,
             )
             if (turn.optString("status") == "failed") {
                 result += TimelineItem(
@@ -193,6 +235,7 @@ object ThreadProjection {
                 startedAtEpochMs = liveTurn.startedAtEpochMs ?: uuidV7Timestamp(turnId),
                 snapshotItems = emptyList(),
                 liveItems = liveTurn.items,
+                turnDiff = liveTurn.turnDiff,
             )
         }
         return result
@@ -221,6 +264,16 @@ object ThreadProjection {
                 stringArray(item.optJSONArray("content"))
             }, TimelineItem.Kind.REASONING)
             "plan" -> TimelineItem(id, "Planning", item.optString("text"), TimelineItem.Kind.PLAN)
+            "hookPrompt" -> TimelineItem(
+                id = id,
+                label = "Hook context",
+                text = item.optJSONArray("fragments").objects()
+                    .map { it.optString("text") }
+                    .filter(String::isNotBlank)
+                    .joinToString("\n"),
+                kind = TimelineItem.Kind.TOOL,
+                phase = "completed",
+            )
             "commandExecution" -> {
                 val originalCommand = item.optString("command")
                 val command = canonicalCommand(originalCommand)
@@ -279,9 +332,29 @@ object ThreadProjection {
                     TimelineItem.Kind.TOOL,
                     phase = normalizedStatus(item.optString("status")),
                     toolStyle = semanticToolStyle(item.optString("tool"), label, TimelineItem.ToolStyle.INTEGRATION),
+                    richOutputReferences = richOutputReferences(item),
                 )
             }
-            "dynamicToolCall", "collabToolCall", "collabAgentToolCall" -> {
+            "collabToolCall", "collabAgentToolCall" -> {
+                val agents = SubagentReference.fromItem(item)
+                val label = when (item.optString("tool")) {
+                    "spawnAgent" -> "Spawn subagent"
+                    "sendInput" -> "Message subagent"
+                    "resumeAgent" -> "Resume subagent"
+                    "wait" -> "Wait for subagents"
+                    "closeAgent" -> "Close subagent"
+                    else -> "Subagents"
+                }
+                val detail = toolCallDetail(item).ifBlank {
+                    buildList {
+                        item.optString("prompt").takeIf { it.isNotBlank() && it != "null" }?.let(::add)
+                        agents.map { it.message }.filter(String::isNotBlank).forEach(::add)
+                    }.joinToString("\n\n")
+                }
+                TimelineItem(id, label, detail,
+                    TimelineItem.Kind.TOOL, phase = normalizedStatus(item.optString("status")), subagents = agents)
+            }
+            "dynamicToolCall" -> {
                 val tool = item.optString("tool", item.optString("type"))
                 if (isCommandTool(tool)) {
                     val command = canonicalCommand(dynamicCommand(item.optJSONObject("arguments")).orEmpty())
@@ -303,6 +376,7 @@ object ThreadProjection {
                         TimelineItem.Kind.TOOL,
                         phase = normalizedStatus(item.optString("status")),
                         toolStyle = semanticToolStyle(tool, label),
+                        richOutputReferences = richOutputReferences(item),
                     )
                 }
             }
@@ -347,7 +421,25 @@ object ThreadProjection {
                 phase = item.optString("status").ifBlank { "completed" },
                 imagePath = item.optString("path").ifBlank { item.optString("savedPath") }.ifBlank { null },
             )
-            "subAgentActivity" -> TimelineItem(id, "Investigating", item.optString("agentPath"), TimelineItem.Kind.TOOL, phase = "completed")
+            "subAgentActivity" -> TimelineItem(id, "Subagent activity", item.optString("agentPath"),
+                TimelineItem.Kind.TOOL, subagents = SubagentReference.fromItem(item))
+            "sleep" -> {
+                val durationMs = (item.opt("durationMs") as? Number)?.toLong()?.coerceAtLeast(0L) ?: 0L
+                TimelineItem(
+                    id = id,
+                    label = "Waited ${formatDuration(durationMs)}",
+                    text = "",
+                    kind = TimelineItem.Kind.TOOL,
+                    phase = "completed",
+                    durationMs = durationMs,
+                )
+            }
+            "enteredReviewMode" -> TimelineItem(
+                id, "Entered review mode", item.optString("review"), TimelineItem.Kind.TOOL, phase = "completed",
+            )
+            "exitedReviewMode" -> TimelineItem(
+                id, "Exited review mode", item.optString("review"), TimelineItem.Kind.TOOL, phase = "completed",
+            )
             "contextCompaction" -> TimelineItem(id, "Compacted context", "", TimelineItem.Kind.TOOL, phase = "completed")
             else -> null
         }
@@ -361,6 +453,7 @@ object ThreadProjection {
         startedAtEpochMs: Long?,
         snapshotItems: List<TimelineItem>,
         liveItems: List<TimelineItem>,
+        turnDiff: TurnDiffSummary?,
     ) {
         val projected = compactEquivalentCommandWrappers(
             classifyAgentMessages(mergeTurnItems(snapshotItems, liveItems)),
@@ -369,7 +462,7 @@ object ThreadProjection {
         val explicitFinalIndex = projected.indexOfLast {
             it.kind == TimelineItem.Kind.ASSISTANT && it.phase == "final_answer"
         }
-        val hasConcreteWork = projected.any { it.kind.isConcreteWork() }
+        val hasConcreteWork = projected.any { it.kind.isConcreteWork() } || turnDiff != null
         val inferredFinalIndex = if (!isRunning && explicitFinalIndex < 0 && hasConcreteWork) {
             projected.indexOfLast { it.kind == TimelineItem.Kind.ASSISTANT }
         } else -1
@@ -394,7 +487,7 @@ object ThreadProjection {
             if (item.kind == TimelineItem.Kind.USER || index == finalAnswerIndex) return@mapIndexedNotNull null
             if (item.kind == TimelineItem.Kind.ASSISTANT) item.copy(kind = TimelineItem.Kind.COMMENTARY) else item
         }
-        val shouldGroup = work.any { it.kind.isWorkDetail() }
+        val shouldGroup = work.any { it.kind.isWorkDetail() } || turnDiff != null
 
         result += users.map { it.copy(active = false) }
         if (shouldGroup) {
@@ -406,6 +499,7 @@ object ThreadProjection {
                 work = work,
                 isRunning = executionIsRunning,
                 assumeLatestActive = executionIsRunning && liveItems.isEmpty(),
+                turnDiff = turnDiff,
             )
         } else {
             result += work.map { it.copy(active = false) }
@@ -421,6 +515,7 @@ object ThreadProjection {
         work: List<TimelineItem>,
         isRunning: Boolean,
         assumeLatestActive: Boolean,
+        turnDiff: TurnDiffSummary?,
     ): TimelineItem {
         val runningConcreteIndex = if (isRunning) {
             work.indexOfLast { it.kind.isConcreteWork() && (it.active || normalizedStatus(it.phase.orEmpty()) in RUNNING_STATUSES) }
@@ -466,10 +561,12 @@ object ThreadProjection {
         val completedActions = concreteActions.count {
             !it.active && normalizedStatus(it.phase.orEmpty()) !in RUNNING_STATUSES
         }
-        val changedFiles = children.flatMap { it.changedFiles }.toSet()
-        val fileDiffs = children.flatMap { it.fileDiffs.entries }.groupBy({ it.key }, { it.value })
+        val childChangedFiles = children.flatMap { it.changedFiles }.toSet()
+        val changedFiles = turnDiff?.changedFiles?.takeIf { it.isNotEmpty() } ?: childChangedFiles
+        val childFileDiffs = children.flatMap { it.fileDiffs.entries }.groupBy({ it.key }, { it.value })
             .mapValues { (_, values) -> values.reduce(FileDiffStat::plus) }
-        val fileChanges = children.flatMap { it.fileChanges }.groupBy(FileDiffDetail::path).map { (path, values) ->
+        val fileDiffs = turnDiff?.fileDiffs?.takeIf { it.isNotEmpty() } ?: childFileDiffs
+        val childFileChanges = children.flatMap { it.fileChanges }.groupBy(FileDiffDetail::path).map { (path, values) ->
             val patches = values.map(FileDiffDetail::patch).filter(String::isNotBlank).distinct()
             FileDiffDetail(
                 path = path,
@@ -480,6 +577,7 @@ object ThreadProjection {
                 displayName = values.last().displayName,
             )
         }
+        val fileChanges = turnDiff?.fileChanges?.takeIf { it.isNotEmpty() } ?: childFileChanges
         return TimelineItem(
             id = "turn-activity-$turnId",
             label = if (isRunning) "Working" else when (normalizedStatus(status)) {
@@ -503,8 +601,8 @@ object ThreadProjection {
             fileDiffs = fileDiffs,
             fileChanges = fileChanges,
             filesChanged = changedFiles.size,
-            additions = children.sumOf { it.additions },
-            deletions = children.sumOf { it.deletions },
+            additions = turnDiff?.additions ?: children.sumOf { it.additions },
+            deletions = turnDiff?.deletions ?: children.sumOf { it.deletions },
         )
     }
 
@@ -632,6 +730,49 @@ object ThreadProjection {
 
     private data class DiffStats(val additions: Int = 0, val deletions: Int = 0) {
         operator fun plus(other: DiffStats) = DiffStats(additions + other.additions, deletions + other.deletions)
+    }
+
+    internal fun turnDiffSummary(diff: String): TurnDiffSummary? {
+        if (diff.isBlank()) return null
+        val sections = mutableListOf<Pair<String, String>>()
+        var path = ""
+        val patch = StringBuilder()
+        fun flush() {
+            if (patch.isNotEmpty()) sections += path to patch.toString().trimEnd('\n')
+            patch.clear()
+        }
+        diff.lineSequence().forEach { line ->
+            if (line.startsWith("diff --git ")) {
+                flush()
+                path = line.substringAfter(" b/", "").trim()
+            }
+            if (path.isBlank() && line.startsWith("+++ ")) {
+                path = line.removePrefix("+++ ").removePrefix("b/").takeUnless { it == "/dev/null" }.orEmpty()
+            }
+            patch.append(line).append('\n')
+        }
+        flush()
+        if (sections.isEmpty()) sections += "Turn diff" to diff.trimEnd('\n')
+        val changes = sections.map { (sectionPath, sectionPatch) ->
+            val resolvedPath = sectionPath.ifBlank { "Turn diff" }
+            val stats = diffStats(JSONObject().put("diff", sectionPatch))
+            FileDiffDetail(
+                path = resolvedPath,
+                patch = sectionPatch,
+                kind = "update",
+                additions = stats.additions,
+                deletions = stats.deletions,
+                displayName = resolvedPath,
+            )
+        }
+        return TurnDiffSummary(
+            patch = diff,
+            changedFiles = changes.map(FileDiffDetail::path).toSet(),
+            fileDiffs = changes.associate { it.path to FileDiffStat(it.additions, it.deletions) },
+            fileChanges = changes,
+            additions = changes.sumOf(FileDiffDetail::additions),
+            deletions = changes.sumOf(FileDiffDetail::deletions),
+        )
     }
 
     private fun diffStats(change: JSONObject): DiffStats {
@@ -940,6 +1081,46 @@ object ThreadProjection {
         }.joinToString("\n")
         if (contentItems.isNotBlank()) return contentItems
         return item.opt("arguments")?.takeUnless { it == JSONObject.NULL }?.toString().orEmpty()
+    }
+
+    private fun richOutputReferences(item: JSONObject): List<RichOutputReference> {
+        val blocks = buildList {
+            addAll(item.optJSONArray("contentItems").objects())
+            addAll(item.optJSONObject("result")?.optJSONArray("content").objects())
+        }
+        return blocks.mapNotNull { block ->
+            val type = block.optString("type")
+            when (type) {
+                "inputImage", "image" -> {
+                    val source = block.optString("imageUrl").ifBlank { block.optString("image_url") }
+                        .ifBlank { block.optString("url") }.ifBlank { block.optString("data") }
+                    source.takeIf(String::isNotBlank)?.let {
+                        RichOutputReference(RichOutputReference.Kind.IMAGE, it, jsonText(block, "mimeType").ifBlank { null })
+                    }
+                }
+                "inputAudio", "audio" -> {
+                    val source = block.optString("audioUrl").ifBlank { block.optString("audio_url") }
+                        .ifBlank { block.optString("url") }.ifBlank { block.optString("data") }
+                    source.takeIf(String::isNotBlank)?.let {
+                        RichOutputReference(RichOutputReference.Kind.AUDIO, it, jsonText(block, "mimeType").ifBlank { null })
+                    }
+                }
+                "resource", "resource_link" -> {
+                    val resource = block.optJSONObject("resource")
+                    val source = jsonText(block, "uri").ifBlank { resource?.let { jsonText(it, "uri") }.orEmpty() }
+                    source.takeIf(String::isNotBlank)?.let {
+                        RichOutputReference(
+                            RichOutputReference.Kind.RESOURCE,
+                            it,
+                            jsonText(block, "mimeType")
+                                .ifBlank { resource?.let { value -> jsonText(value, "mimeType") }.orEmpty() }
+                                .ifBlank { null },
+                        )
+                    }
+                }
+                else -> null
+            }
+        }.distinct()
     }
 
     private fun humanize(value: String): String = value
